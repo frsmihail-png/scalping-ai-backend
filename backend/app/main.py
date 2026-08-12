@@ -2,17 +2,18 @@ import asyncio
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .binance_client import BinanceMarketDataError, fetch_klines
+from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
 from .models import AnalyzeRequest, AnalyzeResponse
 from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-app = FastAPI(title="Scalping AI API", version="0.2.0")
+app = FastAPI(title="Scalping AI API", version="0.2.1")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -27,12 +28,22 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.2.0", "mode": "paper"}
+    return {"name": "Scalping AI API", "version": "0.2.1", "mode": "paper+demo-check"}
 
 
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/binance/demo/status")
+async def binance_demo_status(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
+    try:
+        return await get_demo_status(symbol)
+    except DemoStatusError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ошибка проверки Binance Demo: {exc}") from exc
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
