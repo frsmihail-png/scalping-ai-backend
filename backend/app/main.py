@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from .auto_demo_bot import BotError, best_suggestion, bot_status, start_bot, stop_bot
 from .binance_client import BinanceMarketDataError, fetch_klines
 from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
@@ -13,7 +14,7 @@ from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-app = FastAPI(title="Scalping AI API", version="0.2.1")
+app = FastAPI(title="Scalping AI API", version="0.4.0")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -28,7 +29,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.2.1", "mode": "paper+demo-check"}
+    return {"name": "Scalping AI API", "version": "0.4.0", "mode": "DEMO_AUTO"}
 
 
 @app.get("/health")
@@ -44,6 +45,37 @@ async def binance_demo_status(symbol: str = Query(default="BTCUSDT", min_length=
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка проверки Binance Demo: {exc}") from exc
+
+
+@app.get("/bot/suggestion")
+async def bot_suggestion():
+    try:
+        return await best_suggestion()
+    except BotError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/bot/status")
+async def get_bot_status():
+    return await bot_status()
+
+
+@app.post("/bot/start")
+async def bot_start(confirm: bool = Query(default=False)):
+    if not confirm:
+        raise HTTPException(status_code=409, detail="Для запуска DEMO AUTO укажи confirm=true")
+    try:
+        return await start_bot()
+    except BotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/bot/stop")
+async def bot_stop(close_position: bool = Query(default=False)):
+    try:
+        return await stop_bot(close_position=close_position)
+    except BotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
