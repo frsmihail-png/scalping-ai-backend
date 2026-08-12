@@ -1,41 +1,60 @@
-# Scalping AI Backend v0.2
+# Scalping AI Backend v0.3 — DEMO Futures
 
-FastAPI backend for the Expo mobile app. It uses Binance public Spot market data only; no API keys and no real orders.
+FastAPI backend for market analysis plus guarded Binance USD-M Futures DEMO execution. LIVE trading is intentionally blocked in v0.3.
 
-## Windows quick start
+## Safety profile
+
+- DEMO only
+- leverage fixed to 3x
+- default risk budget: 0.5% of available USDT per trade
+- maximum margin allocation: 25% of available balance
+- daily loss guard: 2%
+- minimum signal confidence: 78%
+- duplicate position protection
+- explicit `confirm=true` required for every open/close request
+- symbol allowlist
+
+A 1% profit per trade is NOT guaranteed. The engine sizes risk; it does not promise returns.
+
+## Render environment variables
+
+Add these in Render -> Service -> Environment. Never commit API secrets to GitHub.
+
+```env
+TRADING_MODE=DEMO
+ENABLE_DEMO_TRADING=false
+BINANCE_DEMO_API_KEY=YOUR_DEMO_KEY
+BINANCE_DEMO_API_SECRET=YOUR_DEMO_SECRET
+BINANCE_DEMO_FUTURES_URL=https://demo-fapi.binance.com
+BOT_LEVERAGE=3
+BOT_RISK_PER_TRADE=0.005
+BOT_MAX_DAILY_LOSS=0.02
+BOT_MAX_CONSECUTIVE_LOSSES=3
+BOT_MIN_CONFIDENCE=0.78
+BOT_MAX_MARGIN_FRACTION=0.25
+BOT_ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT
+```
+
+Keep `ENABLE_DEMO_TRADING=false` for the first deployment. Check `/trade/demo/status`; only then switch it to `true`.
+
+## Endpoints
+
+- `GET /health`
+- `POST /analyze`
+- `GET /trade/demo/status?symbol=BTCUSDT`
+- `POST /trade/demo/open?symbol=BTCUSDT&interval=1m&confirm=true`
+- `POST /trade/demo/close?symbol=BTCUSDT&confirm=true`
+
+## Important v0.3 limitation
+
+The first DEMO execution milestone validates authenticated connectivity, leverage, position sizing, duplicate-entry protection and market entry/close. Automatic server-side protective SL/TP is deliberately not enabled yet; validate DEMO order behavior first. Do not use this branch for real funds.
+
+## Local start
 
 ```bat
 cd backend
 py -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-Open `http://127.0.0.1:8000/health` on the PC. It should return `{\"ok\":true}`.
-
-For an Android phone on the same Wi-Fi, set `EXPO_PUBLIC_API_URL` in `mobile/.env` to the PC's LAN IP, for example:
-
-```env
-EXPO_PUBLIC_API_URL=http://192.168.1.50:8000
-```
-
-Do NOT use `127.0.0.1` in an installed Android APK unless the backend is running on the phone itself.
-
-## Endpoints
-
-- `GET /health`
-- `POST /analyze`
-
-Example body:
-
-```json
-{"symbol":"BTCUSDT","interval":"1m"}
-```
-
-## Current strategy
-
-Multi-timeframe 1m/3m/5m/15m scoring using EMA 9/21/50/200, RSI, MACD, ADX, ATR, Bollinger Bands, VWAP, volume ratio, support/resistance and an anti-chasing filter.
-
-This is PAPER MODE. It does not place real orders.
