@@ -14,7 +14,7 @@ from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-app = FastAPI(title="Scalping AI API", version="0.4.0")
+app = FastAPI(title="Scalping AI API", version="0.4.1")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -29,7 +29,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.4.0", "mode": "DEMO_AUTO"}
+    return {"name": "Scalping AI API", "version": "0.4.1", "mode": "DEMO_AUTO"}
 
 
 @app.get("/health")
@@ -60,8 +60,9 @@ async def get_bot_status():
     return await bot_status()
 
 
-@app.post("/bot/start")
+@app.post("/bot/start", summary="AUTO START")
 async def bot_start(confirm: bool = Query(default=False)):
+    """Запускает автоматический DEMO-скальпинг после явного подтверждения."""
     if not confirm:
         raise HTTPException(status_code=409, detail="Для запуска DEMO AUTO укажи confirm=true")
     try:
@@ -70,10 +71,50 @@ async def bot_start(confirm: bool = Query(default=False)):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/bot/stop")
+@app.post("/bot/stop", summary="STOP AUTO")
 async def bot_stop(close_position: bool = Query(default=False)):
+    """Останавливает новые входы. При close_position=true также закрывает текущие позиции."""
     try:
         return await stop_bot(close_position=close_position)
+    except BotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/bot/emergency-stop", summary="EMERGENCY STOP — запретить новые входы")
+async def bot_emergency_stop():
+    """
+    Немедленно выключает AUTO и запрещает новые входы.
+    Уже открытые позиции НЕ закрывает: их защитные SL/TP остаются на Binance.
+    """
+    try:
+        result = await stop_bot(close_position=False)
+        return {
+            "ok": True,
+            "action": "EMERGENCY_STOP",
+            "message": "AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.",
+            "status": result,
+        }
+    except BotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/bot/close-all", summary="CLOSE ALL — закрыть все сделки")
+async def bot_close_all(confirm: bool = Query(default=False)):
+    """
+    Аварийное закрытие всех открытых DEMO Futures позиций рыночными reduce-only ордерами.
+    Перед закрытием AUTO выключается, чтобы бот не открыл новую сделку на следующем цикле.
+    Связанные защитные algo-ордера отменяются после закрытия позиций.
+    """
+    if not confirm:
+        raise HTTPException(status_code=409, detail="Для закрытия всех DEMO-позиций укажи confirm=true")
+    try:
+        result = await stop_bot(close_position=True)
+        return {
+            "ok": True,
+            "action": "CLOSE_ALL",
+            "message": "AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.",
+            "status": result,
+        }
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
