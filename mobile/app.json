@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Scalping AI",
+    "slug": "scalping-ai-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "android": {
+      "package": "com.frs.scalpingai",
+      "versionCode": 1,
+      "usesCleartextTraffic": false
+    },
+    "extra": {
+      "panelUrl": "https://scalping-ai-backend-ishr.onrender.com/panel"
+    }
+  }
+}
