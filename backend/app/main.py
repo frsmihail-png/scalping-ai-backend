@@ -1,11 +1,13 @@
 import asyncio
 import os
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+from . import auto_demo_bot as bot_engine
 from .auto_demo_bot import BotError, best_suggestion, bot_status, start_bot, stop_bot
 from .binance_client import BinanceMarketDataError, fetch_klines
 from .demo_status import DemoStatusError, get_demo_status
@@ -16,7 +18,11 @@ from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-app = FastAPI(title="Scalping AI API", version="0.4.2")
+# Requested DEMO tuning. The score is an internal strategy score, not a guaranteed win probability.
+bot_engine.CONFIDENCE_THRESHOLD = 0.77
+bot_engine.SCAN_INTERVAL_SEC = 10
+
+app = FastAPI(title="Scalping AI API", version="0.5.0")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -31,7 +37,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.4.2", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.5.0", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
@@ -42,6 +48,42 @@ async def panel():
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/market/live")
+async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
+    """Public LIVE Binance USD-M Futures price and top-10 order book. Trading remains DEMO."""
+    symbol = symbol.upper().strip()
+    base = "https://fapi.binance.com"
+    timeout = httpx.Timeout(5.0, connect=3.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            ticker_req = client.get(f"{base}/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
+            price_req = client.get(f"{base}/fapi/v1/ticker/price", params={"symbol": symbol})
+            depth_req = client.get(f"{base}/fapi/v1/depth", params={"symbol": symbol, "limit": 10})
+            ticker_res, price_res, depth_res = await asyncio.gather(ticker_req, price_req, depth_req)
+        for response in (ticker_res, price_res, depth_res):
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Binance LIVE {response.status_code}: {response.text}")
+        ticker = ticker_res.json()
+        price = price_res.json()
+        depth = depth_res.json()
+        return {
+            "source": "BINANCE_LIVE_USDM",
+            "symbol": symbol,
+            "price": float(price.get("price", 0.0)),
+            "bid": float(ticker.get("bidPrice", 0.0)),
+            "bid_qty": float(ticker.get("bidQty", 0.0)),
+            "ask": float(ticker.get("askPrice", 0.0)),
+            "ask_qty": float(ticker.get("askQty", 0.0)),
+            "bids": [[float(p), float(q)] for p, q in depth.get("bids", [])],
+            "asks": [[float(p), float(q)] for p, q in depth.get("asks", [])],
+            "last_update_id": depth.get("lastUpdateId"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Ошибка LIVE Binance Futures: {exc}") from exc
 
 
 @app.get("/binance/demo/status")
@@ -89,10 +131,7 @@ async def bot_stop(close_position: bool = Query(default=False)):
 
 @app.post("/bot/emergency-stop", summary="EMERGENCY STOP — запретить новые входы")
 async def bot_emergency_stop():
-    """
-    Немедленно выключает AUTO и запрещает новые входы.
-    Уже открытые позиции НЕ закрывает: их защитные SL/TP остаются на Binance.
-    """
+    """Немедленно выключает AUTO. Открытые позиции не закрывает."""
     try:
         result = await stop_bot(close_position=False)
         return {
@@ -107,11 +146,7 @@ async def bot_emergency_stop():
 
 @app.post("/bot/close-all", summary="CLOSE ALL — закрыть все сделки")
 async def bot_close_all(confirm: bool = Query(default=False)):
-    """
-    Аварийное закрытие всех открытых DEMO Futures позиций рыночными reduce-only ордерами.
-    Перед закрытием AUTO выключается, чтобы бот не открыл новую сделку на следующем цикле.
-    Связанные защитные algo-ордера отменяются после закрытия позиций.
-    """
+    """Отключает AUTO и закрывает все DEMO Futures позиции."""
     if not confirm:
         raise HTTPException(status_code=409, detail="Для закрытия всех DEMO-позиций укажи confirm=true")
     try:
