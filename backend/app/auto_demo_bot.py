@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import urlencode
@@ -27,11 +27,8 @@ RISK_PER_TRADE = float(os.getenv("BOT_RISK_PER_TRADE", "0.005"))
 MAX_DAILY_LOSS = float(os.getenv("BOT_MAX_DAILY_LOSS", "0.02"))
 MAX_MARGIN_FRACTION = float(os.getenv("BOT_MAX_MARGIN_FRACTION", "0.25"))
 SCAN_INTERVAL_SEC = int(os.getenv("BOT_SCAN_INTERVAL_SEC", "10"))
-COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "90"))
-
-# Scalping target: ~1% net return on used margin, not on full account balance.
+COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "30"))
 TARGET_NET_MARGIN_ROI = float(os.getenv("BOT_TARGET_NET_MARGIN_ROI", "0.01"))
-# Conservative defaults for MARKET entry + MARKET protective exit. Can be overridden in Render env.
 TAKER_FEE_RATE = float(os.getenv("BOT_TAKER_FEE_RATE", "0.0005"))
 ROUNDTRIP_SLIPPAGE_RATE = float(os.getenv("BOT_ROUNDTRIP_SLIPPAGE_RATE", "0.0004"))
 MIN_STOP_PCT = float(os.getenv("BOT_MIN_STOP_PCT", "0.0015"))
@@ -53,6 +50,9 @@ class BotRuntime:
     last_error: str | None = None
     last_closed_symbol: str | None = None
     last_entry_at: float | None = None
+    execution_state: str = "STOPPED"
+    last_order_attempt: dict | None = None
+    consecutive_errors: int = 0
 
 
 runtime = BotRuntime()
@@ -86,7 +86,10 @@ async def _request(method: str, path: str, params: dict[str, Any] | None = None,
         except Exception:
             body = response.text
         raise BotError(f"Binance Demo {response.status_code}: {body}")
-    return response.json()
+    try:
+        return response.json()
+    except Exception:
+        return {}
 
 
 async def _klines(symbol: str, interval: str, limit: int = 250) -> list[list]:
@@ -117,7 +120,7 @@ async def best_suggestion() -> dict:
     if not clean:
         raise BotError(f"Не удалось проанализировать пары: {errors}")
     best = max(clean, key=lambda x: x.get("confidence", 0.0))
-    best["eligible"] = bool(best.get("action") in {"BUY", "SELL"} and best.get("confidence", 0.0) >= CONFIDENCE_THRESHOLD)
+    best["eligible"] = bool(best.get("action") in {"BUY", "SELL"} and float(best.get("confidence", 0.0)) >= CONFIDENCE_THRESHOLD)
     best["threshold"] = CONFIDENCE_THRESHOLD
     best["scan_errors"] = errors
     return best
@@ -155,8 +158,20 @@ async def _positions() -> list[dict]:
                 "mark_price": float(p.get("markPrice", 0.0)),
                 "unrealized_profit": float(p.get("unRealizedProfit", 0.0)),
                 "leverage": int(float(p.get("leverage", 0) or 0)),
+                "liquidation_price": float(p.get("liquidationPrice", 0.0) or 0.0),
+                "isolated_margin": float(p.get("isolatedMargin", 0.0) or 0.0),
             })
     return out
+
+
+async def _wait_for_position(symbol: str, attempts: int = 6, delay: float = 0.5) -> dict:
+    for _ in range(attempts):
+        positions = await _positions()
+        p = next((x for x in positions if x.get("symbol") == symbol), None)
+        if p:
+            return p
+        await asyncio.sleep(delay)
+    raise BotError(f"MARKET ордер отправлен, но позиция {symbol} не появилась")
 
 
 async def _exchange_symbol_info(symbol: str) -> dict:
@@ -186,6 +201,11 @@ async def _quantity(symbol: str, notional: float, price: float) -> float:
     qty = _floor_to_step(notional / price, lot["stepSize"])
     if qty < float(lot["minQty"]):
         raise BotError(f"Размер позиции меньше minQty для {symbol}")
+    min_notional = filters.get("MIN_NOTIONAL")
+    if min_notional:
+        minimum = float(min_notional.get("notional", 0.0) or 0.0)
+        if qty * price < minimum:
+            raise BotError(f"Размер позиции меньше MIN_NOTIONAL {minimum} USDT для {symbol}")
     return qty
 
 
@@ -206,7 +226,6 @@ async def _set_isolated_margin(symbol: str) -> None:
         await _request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"}, signed=True)
     except BotError as exc:
         text = str(exc)
-        # Binance code -4046 means margin type is already set; that is safe to ignore.
         if "-4046" not in text and "No need to change margin type" not in text:
             raise
 
@@ -224,30 +243,30 @@ async def _market_order(symbol: str, side: str, quantity: float, reduce_only: bo
     return await _request("POST", "/fapi/v1/order", params, signed=True)
 
 
-async def _algo_close_order(symbol: str, side: str, kind: str, trigger_price: float) -> dict:
+async def _protective_order(symbol: str, side: str, kind: str, trigger_price: float) -> dict:
     params = {
-        "algoType": "CONDITIONAL",
         "symbol": symbol,
         "side": side,
         "type": kind,
-        "triggerPrice": format(Decimal(str(trigger_price)).normalize(), "f"),
+        "stopPrice": format(Decimal(str(trigger_price)).normalize(), "f"),
         "closePosition": "true",
         "workingType": "MARK_PRICE",
         "priceProtect": "TRUE",
     }
-    return await _request("POST", "/fapi/v1/algoOrder", params, signed=True)
+    return await _request("POST", "/fapi/v1/order", params, signed=True)
 
 
-async def _cancel_algo_orders(symbol: str) -> None:
+async def _cancel_open_orders(symbol: str) -> None:
     try:
-        await _request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol}, signed=True)
+        await _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
     except BotError as exc:
-        if "Unknown order" not in str(exc) and "not found" not in str(exc).lower():
+        text = str(exc).lower()
+        if "unknown order" not in text and "not found" not in text:
             raise
 
 
-async def _open_algo_orders(symbol: str) -> list[dict]:
-    data = await _request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
+async def _open_orders(symbol: str) -> list[dict]:
+    data = await _request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
     return data if isinstance(data, list) else []
 
 
@@ -255,33 +274,44 @@ async def _emergency_close(symbol: str) -> None:
     positions = await _positions()
     p = next((x for x in positions if x["symbol"] == symbol), None)
     if not p:
+        await _cancel_open_orders(symbol)
         return
     side = "SELL" if p["position_amt"] > 0 else "BUY"
     await _market_order(symbol, side, abs(p["position_amt"]), reduce_only=True)
-    await _cancel_algo_orders(symbol)
+    await _cancel_open_orders(symbol)
 
 
 def _target_price_from_margin_roi(entry: float, side: str) -> tuple[float, float]:
-    # Net ROI on margin ~= price_move*leverage - roundtrip_fees*leverage - slippage*leverage.
     required_price_move = TARGET_NET_MARGIN_ROI / LEVERAGE + (2 * TAKER_FEE_RATE) + ROUNDTRIP_SLIPPAGE_RATE
     tp = entry * (1 + required_price_move) if side == "BUY" else entry * (1 - required_price_move)
     return tp, required_price_move
 
 
+def _normalized_stop_pct(signal_entry: float, strategy_stop: float) -> tuple[float, bool]:
+    raw = abs(signal_entry - strategy_stop) / signal_entry
+    if raw > MAX_STOP_PCT:
+        raise BotError(f"SL слишком далеко: {raw:.3%} > {MAX_STOP_PCT:.3%}")
+    # A signal stop that is too tight used to reject otherwise valid entries.
+    # Expand it to the configured minimum instead of silently skipping the trade.
+    return max(raw, MIN_STOP_PCT), raw < MIN_STOP_PCT
+
+
 async def execute_signal(signal: dict) -> dict:
-    symbol = signal["symbol"]
-    side = signal["action"]
+    symbol = str(signal["symbol"]).upper()
+    side = str(signal["action"]).upper()
+    confidence = float(signal.get("confidence", 0.0))
+    runtime.execution_state = "PREPARING_ORDER"
+    runtime.last_order_attempt = {"symbol": symbol, "side": side, "confidence": confidence, "at": time.time(), "stage": "VALIDATE"}
+
     if side not in {"BUY", "SELL"}:
         raise BotError("Signal is HOLD")
-    if signal.get("confidence", 0.0) < CONFIDENCE_THRESHOLD:
-        raise BotError("Confidence below threshold")
-    if signal.get("stop_loss") is None:
-        raise BotError("Signal has no SL")
+    if confidence < CONFIDENCE_THRESHOLD:
+        raise BotError(f"Confidence {confidence:.2%} ниже порога {CONFIDENCE_THRESHOLD:.2%}")
+    if signal.get("stop_loss") is None or signal.get("entry") is None:
+        raise BotError("Signal has no Entry/SL")
     if await _position_mode_is_hedge():
         raise BotError("Hedge Mode включен. Нужен One-way Mode.")
-
-    current_positions = await _positions()
-    if current_positions:
+    if await _positions():
         raise BotError("Уже есть открытая позиция — второй вход заблокирован")
 
     bal = await _balance()
@@ -292,53 +322,61 @@ async def execute_signal(signal: dict) -> dict:
 
     signal_entry = float(signal["entry"])
     strategy_stop = float(signal["stop_loss"])
-    stop_pct = abs(signal_entry - strategy_stop) / signal_entry
-    if stop_pct < MIN_STOP_PCT or stop_pct > MAX_STOP_PCT:
-        raise BotError(f"SL вне допустимого диапазона: {stop_pct:.3%}")
+    stop_pct, stop_was_expanded = _normalized_stop_pct(signal_entry, strategy_stop)
 
-    # Position size is chosen from risk budget, then capped by max margin allocation.
     risk_usdt = bal["available_balance"] * RISK_PER_TRADE
     notional_by_risk = risk_usdt / stop_pct
     max_notional = bal["available_balance"] * MAX_MARGIN_FRACTION * LEVERAGE
     notional = min(notional_by_risk, max_notional)
     qty = await _quantity(symbol, notional, signal_entry)
 
-    await _cancel_algo_orders(symbol)
+    runtime.last_order_attempt.update({"stage": "CONFIGURE", "qty": qty, "notional": notional, "stop_pct": stop_pct})
+    await _cancel_open_orders(symbol)
     await _set_isolated_margin(symbol)
     await _set_leverage(symbol)
 
+    runtime.execution_state = "SENDING_MARKET_ORDER"
+    runtime.last_order_attempt["stage"] = "MARKET_ORDER"
     market = await _market_order(symbol, side, qty)
-    fill_entry = float(market.get("avgPrice") or market.get("price") or signal_entry)
-    if fill_entry <= 0:
-        fill_entry = signal_entry
 
-    # Keep the strategy-defined structural SL distance, but anchor it to actual fill.
+    runtime.execution_state = "VERIFYING_POSITION"
+    position = await _wait_for_position(symbol)
+    fill_entry = float(position.get("entry_price") or market.get("avgPrice") or market.get("price") or signal_entry)
+    if fill_entry <= 0:
+        raise BotError("Не удалось получить фактическую цену входа")
+
     stop_trigger_raw = fill_entry * (1 - stop_pct) if side == "BUY" else fill_entry * (1 + stop_pct)
     target_raw, target_move_pct = _target_price_from_margin_roi(fill_entry, side)
-
     exit_side = "SELL" if side == "BUY" else "BUY"
     stop_trigger = await _rounded_trigger(symbol, stop_trigger_raw)
     tp_trigger = await _rounded_trigger(symbol, target_raw)
 
+    runtime.execution_state = "SETTING_PROTECTION"
+    runtime.last_order_attempt.update({"stage": "PROTECTION", "fill_entry": fill_entry, "sl": stop_trigger, "tp": tp_trigger})
     try:
-        sl_order = await _algo_close_order(symbol, exit_side, "STOP_MARKET", stop_trigger)
-        tp_order = await _algo_close_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
-        active = await _open_algo_orders(symbol)
-        if len(active) < 2:
-            raise BotError("Binance не подтвердил два защитных algo-ордера")
-    except Exception:
+        sl_order = await _protective_order(symbol, exit_side, "STOP_MARKET", stop_trigger)
+        tp_order = await _protective_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
+        await asyncio.sleep(0.35)
+        active = await _open_orders(symbol)
+        protective = [o for o in active if o.get("type") in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}]
+        if len(protective) < 2:
+            raise BotError(f"Binance подтвердил недостаточно защитных ордеров: {len(protective)}/2")
+    except Exception as exc:
+        runtime.execution_state = "EMERGENCY_CLOSE"
+        runtime.last_order_attempt["protection_error"] = str(exc)
         await _emergency_close(symbol)
-        raise
+        raise BotError(f"Защитные ордера не установлены, позиция аварийно закрыта: {exc}") from exc
 
-    margin_used_est = notional / LEVERAGE
+    actual_notional = abs(float(position.get("position_amt", qty))) * fill_entry
+    margin_used_est = actual_notional / LEVERAGE
     trade = {
         "symbol": symbol,
         "side": side,
-        "confidence_score": signal["confidence"],
-        "quantity": qty,
+        "confidence_score": confidence,
+        "quantity": abs(float(position.get("position_amt", qty))),
         "leverage": LEVERAGE,
         "margin_type": "ISOLATED",
-        "estimated_notional_usdt": round(notional, 4),
+        "estimated_notional_usdt": round(actual_notional, 4),
         "estimated_margin_used_usdt": round(margin_used_est, 4),
         "risk_budget_usdt": round(risk_usdt, 4),
         "target_net_margin_roi": TARGET_NET_MARGIN_ROI,
@@ -347,6 +385,7 @@ async def execute_signal(signal: dict) -> dict:
         "roundtrip_slippage_rate_assumed": ROUNDTRIP_SLIPPAGE_RATE,
         "entry_price": fill_entry,
         "stop_loss": stop_trigger,
+        "stop_was_expanded_to_minimum": stop_was_expanded,
         "take_profit": tp_trigger,
         "entry_order": market,
         "stop_order": sl_order,
@@ -355,6 +394,10 @@ async def execute_signal(signal: dict) -> dict:
     }
     runtime.last_trade = trade
     runtime.last_entry_at = time.time()
+    runtime.last_error = None
+    runtime.consecutive_errors = 0
+    runtime.execution_state = "POSITION_OPEN"
+    runtime.last_order_attempt.update({"stage": "DONE", "success": True})
     return trade
 
 
@@ -366,39 +409,59 @@ async def _housekeeping_after_close() -> None:
         return
     positions = await _positions()
     if not any(p["symbol"] == symbol for p in positions):
-        await _cancel_algo_orders(symbol)
+        await _cancel_open_orders(symbol)
         runtime.last_closed_symbol = symbol
+        runtime.execution_state = "SCANNING" if runtime.enabled else "STOPPED"
 
 
 async def _loop() -> None:
     while runtime.enabled:
         try:
+            runtime.execution_state = "SCANNING"
             runtime.last_scan_at = time.time()
             bal = await _balance()
             if runtime.day_start_balance is None:
                 runtime.day_start_balance = bal["balance"]
             if runtime.day_start_balance > 0 and bal["balance"] <= runtime.day_start_balance * (1 - MAX_DAILY_LOSS):
                 runtime.last_error = "Достигнут дневной лимит убытка. AUTO остановлен."
+                runtime.execution_state = "DAILY_LOSS_STOP"
                 runtime.enabled = False
                 break
 
             positions = await _positions()
             if positions:
+                runtime.execution_state = "POSITION_OPEN"
                 runtime.last_signal = {"action": "WAIT_POSITION", "positions": positions}
             else:
                 await _housekeeping_after_close()
                 suggestion = await best_suggestion()
                 runtime.last_signal = suggestion
-                cooldown_ok = runtime.last_entry_at is None or (time.time() - runtime.last_entry_at) >= COOLDOWN_SEC
-                if suggestion.get("eligible") and cooldown_ok:
+                cooldown_left = 0.0 if runtime.last_entry_at is None else max(0.0, COOLDOWN_SEC - (time.time() - runtime.last_entry_at))
+                suggestion["cooldown_left_sec"] = round(cooldown_left, 1)
+                if suggestion.get("eligible") and cooldown_left <= 0:
+                    runtime.execution_state = "ENTRY_SIGNAL"
                     await execute_signal(suggestion)
-            runtime.last_error = None
+                elif suggestion.get("eligible"):
+                    runtime.execution_state = "COOLDOWN"
+                else:
+                    runtime.execution_state = "SCANNING"
+                    # Only clear stale execution errors after a clean scan with no entry attempt.
+                    if runtime.consecutive_errors == 0:
+                        runtime.last_error = None
+            runtime.consecutive_errors = 0
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             runtime.last_error = str(exc)
+            runtime.consecutive_errors += 1
+            runtime.execution_state = "ERROR"
+            if runtime.last_order_attempt is not None:
+                runtime.last_order_attempt["error"] = str(exc)
+                runtime.last_order_attempt["success"] = False
             if "дневной лимит" in runtime.last_error.lower() or "hedge mode" in runtime.last_error.lower():
                 runtime.enabled = False
                 break
-        await asyncio.sleep(max(5, SCAN_INTERVAL_SEC))
+        await asyncio.sleep(max(3, SCAN_INTERVAL_SEC))
 
 
 async def start_bot() -> dict:
@@ -419,6 +482,8 @@ async def start_bot() -> dict:
         runtime.started_at = time.time()
         runtime.day_start_balance = bal["balance"]
         runtime.last_error = None
+        runtime.consecutive_errors = 0
+        runtime.execution_state = "SCANNING"
         _task = asyncio.create_task(_loop(), name="scalping-auto-demo")
         return await bot_status()
 
@@ -426,6 +491,7 @@ async def start_bot() -> dict:
 async def stop_bot(close_position: bool = False) -> dict:
     global _task
     runtime.enabled = False
+    runtime.execution_state = "STOPPING"
     if _task and not _task.done():
         _task.cancel()
         try:
@@ -436,6 +502,7 @@ async def stop_bot(close_position: bool = False) -> dict:
     if close_position:
         for p in await _positions():
             await _emergency_close(p["symbol"])
+    runtime.execution_state = "STOPPED"
     return await bot_status()
 
 
@@ -461,6 +528,7 @@ async def bot_status() -> dict:
         "taker_fee_rate_assumed": TAKER_FEE_RATE,
         "roundtrip_slippage_rate_assumed": ROUNDTRIP_SLIPPAGE_RATE,
         "scan_interval_sec": SCAN_INTERVAL_SEC,
+        "cooldown_sec": COOLDOWN_SEC,
         "symbols": SYMBOLS,
         "balance": bal,
         "positions": positions,
