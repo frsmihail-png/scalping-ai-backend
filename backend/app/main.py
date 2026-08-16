@@ -21,7 +21,7 @@ load_dotenv()
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.3")
+app = FastAPI(title="Scalping AI API", version="0.5.4")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -33,13 +33,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+AUTO_BUTTON_SCRIPT = r'''
+<style>
+button.start.running{background:#0f7b52!important;box-shadow:0 0 0 1px #38d792 inset,0 0 18px rgba(53,208,140,.18)}
+button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px;opacity:.8;margin-left:8px}
+</style>
+<script>
+(function(){
+  function getAutoState(){
+    const el=document.getElementById('auto');
+    return !!el && String(el.textContent||'').trim().toUpperCase()==='RUNNING';
+  }
+  function updateAutoStartButton(){
+    const btn=document.querySelector('button.start');
+    if(!btn)return;
+    const active=getAutoState();
+    btn.classList.toggle('running',active);
+    btn.innerHTML=active?'Ⅱ AUTO ACTIVE':'▶ AUTO START';
+    btn.title=active?'AUTO активно: нажмите эту кнопку, чтобы остановить поиск входа':'AUTO остановлено: нажмите, чтобы начать поиск точки входа';
+    btn.setAttribute('aria-pressed',active?'true':'false');
+  }
+  function bindToggle(){
+    const btn=document.querySelector('button.start');
+    if(!btn||btn.dataset.toggleBound==='1')return;
+    btn.dataset.toggleBound='1';
+    btn.removeAttribute('onclick');
+    btn.addEventListener('click',async function(){
+      if(getAutoState()){
+        if(typeof stopBot==='function') await stopBot();
+      }else{
+        if(typeof startBot==='function') await startBot();
+      }
+      setTimeout(updateAutoStartButton,80);
+    });
+  }
+  function init(){
+    bindToggle();
+    updateAutoStartButton();
+    const autoEl=document.getElementById('auto');
+    if(autoEl){
+      new MutationObserver(updateAutoStartButton).observe(autoEl,{childList:true,characterData:true,subtree:true});
+    }
+    setInterval(function(){bindToggle();updateAutoStartButton();},1500);
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
+})();
+</script>
+'''
+
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.3", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.5.4", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
-    return HTMLResponse(content=PANEL_HTML, status_code=200)
+    html = PANEL_HTML.replace("</body>", AUTO_BUTTON_SCRIPT + "</body>")
+    return HTMLResponse(content=html, status_code=200)
 
 @app.get("/health")
 async def health():
