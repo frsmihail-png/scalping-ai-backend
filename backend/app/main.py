@@ -21,7 +21,7 @@ load_dotenv()
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.4")
+app = FastAPI(title="Scalping AI API", version="0.5.5")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -83,7 +83,7 @@ button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.4", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.5.5", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
