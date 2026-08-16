@@ -60,7 +60,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     long_score = 0.0
     short_score = 0.0
 
-    # Trend structure
     if e9 > e21:
         long_score += 10
     else:
@@ -74,7 +73,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     else:
         short_score += 7
 
-    # Momentum and mean reversion, deliberately asymmetric at extremes.
     if mh > 0:
         long_score += 8
     else:
@@ -84,8 +82,8 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     elif 28 <= rv <= 48:
         short_score += 7
     elif rv < 25:
-        long_score += 4       # oversold bounce potential
-        short_score -= 5      # avoid chasing late shorts
+        long_score += 4
+        short_score -= 5
     elif rv > 75:
         short_score += 4
         long_score -= 5
@@ -102,7 +100,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
         short_score += 4
         long_score -= 3
 
-    # Trend quality / volume confirmation.
     if ax >= 25:
         if state == "UPTREND":
             long_score += 8
@@ -118,7 +115,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
         else:
             short_score += 5
 
-    # Location filter: do not buy directly into resistance or sell directly into support.
     distance_support = max(price - support, 0.0)
     distance_resistance = max(resistance - price, 0.0)
     if av > 0:
@@ -155,30 +151,71 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     )
 
 
+def _frame_bias(frame: FrameAnalysis | None) -> str:
+    if frame is None:
+        return "NEUTRAL"
+    diff = frame.long_score - frame.short_score
+    if frame.state == "UPTREND" or diff >= 8:
+        return "LONG"
+    if frame.state == "DOWNTREND" or diff <= -8:
+        return "SHORT"
+    return "NEUTRAL"
+
+
 def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
-    weights = {"1m": 0.40, "3m": 0.25, "5m": 0.20, "15m": 0.15}
-    long_total = sum(frames[k].long_score * weights.get(k, 0) for k in frames)
-    short_total = sum(frames[k].short_score * weights.get(k, 0) for k in frames)
+    # Scalping entries remain driven by short frames, but 1h/4h now act as a
+    # directional regime filter so the bot does not blindly scalp against the larger move.
+    weights = {"1m": 0.25, "3m": 0.20, "5m": 0.15, "15m": 0.15, "1h": 0.15, "4h": 0.10}
+    active_weight = sum(weights.get(k, 0.0) for k in frames) or 1.0
+    long_total = sum(frames[k].long_score * weights.get(k, 0.0) for k in frames) / active_weight
+    short_total = sum(frames[k].short_score * weights.get(k, 0.0) for k in frames) / active_weight
     p = frames[primary]
 
     bullish = sum(1 for f in frames.values() if f.long_score > f.short_score)
     bearish = sum(1 for f in frames.values() if f.short_score > f.long_score)
-    if bullish >= 3:
+    agreement_needed = max(3, (len(frames) + 1) // 2)
+    if bullish >= agreement_needed:
         long_total += 8
-    if bearish >= 3:
+    if bearish >= agreement_needed:
         short_total += 8
+
+    h1_bias = _frame_bias(frames.get("1h"))
+    h4_bias = _frame_bias(frames.get("4h"))
+    higher_tf_bias = "NEUTRAL"
+    if h1_bias == h4_bias and h1_bias in {"LONG", "SHORT"}:
+        higher_tf_bias = h1_bias
+    elif h1_bias in {"LONG", "SHORT"} and h4_bias == "NEUTRAL":
+        higher_tf_bias = h1_bias
+    elif h4_bias in {"LONG", "SHORT"} and h1_bias == "NEUTRAL":
+        higher_tf_bias = h4_bias
+    elif h1_bias != h4_bias and h1_bias != "NEUTRAL" and h4_bias != "NEUTRAL":
+        higher_tf_bias = "CONFLICT"
 
     dominant = max(long_total, short_total)
     diff = abs(long_total - short_total)
-    # 75 points is a practical upper scale for this scoring model.
     raw_conf = min(0.95, max(0.50, dominant / 75.0))
 
-    action = "HOLD"
+    candidate = "HOLD"
     if diff >= 9 and raw_conf >= 0.68:
-        action = "BUY" if long_total > short_total else "SELL"
+        candidate = "BUY" if long_total > short_total else "SELL"
 
     warnings: List[str] = []
     reasons: List[str] = []
+
+    # Hard regime protection: do not open directly against a confirmed 1h+4h trend.
+    action = candidate
+    if candidate == "BUY" and higher_tf_bias == "SHORT":
+        action = "HOLD"
+        raw_conf = min(raw_conf, 0.76)
+        warnings.append("BUY заблокирован: 1h/4h подтверждают нисходящее направление")
+    elif candidate == "SELL" and higher_tf_bias == "LONG":
+        action = "HOLD"
+        raw_conf = min(raw_conf, 0.76)
+        warnings.append("SELL заблокирован: 1h/4h подтверждают восходящее направление")
+    elif higher_tf_bias == "CONFLICT":
+        action = "HOLD"
+        raw_conf = min(raw_conf, 0.72)
+        warnings.append("1h и 4h конфликтуют — вход отложен до согласования направления")
 
     if p.ema9 > p.ema21:
         reasons.append("EMA9 выше EMA21: краткосрочный импульс бычий")
@@ -189,12 +226,14 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
     reasons.append("Цена выше VWAP" if p.price > p.vwap else "Цена ниже VWAP")
     if p.volume_ratio >= 1.35:
         reasons.append(f"Объём повышен: {p.volume_ratio:.2f}× среднего")
-    if bullish >= 3:
-        reasons.append(f"{bullish}/4 таймфреймов склоняются в LONG")
-    elif bearish >= 3:
-        reasons.append(f"{bearish}/4 таймфреймов склоняются в SHORT")
+    if bullish >= agreement_needed:
+        reasons.append(f"{bullish}/{len(frames)} таймфреймов склоняются в LONG")
+    elif bearish >= agreement_needed:
+        reasons.append(f"{bearish}/{len(frames)} таймфреймов склоняются в SHORT")
     else:
         reasons.append("Таймфреймы не дают согласованного направления")
+    if "1h" in frames or "4h" in frames:
+        reasons.append(f"Старший тренд: 1h={h1_bias}, 4h={h4_bias}")
 
     if p.rsi < 25 and p.state == "DOWNTREND":
         warnings.append("RSI в глубокой перепроданности: новый SHORT может быть запоздалым")
@@ -220,20 +259,23 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         take3 = entry - risk * 3.0
         rr = 2.0
     else:
-        raw_conf = min(raw_conf, 0.67)
-        warnings.append("Нет достаточного преимущества BUY или SELL — лучше ждать подтверждения")
+        raw_conf = min(raw_conf, 0.76)
+        if not warnings:
+            warnings.append("Нет достаточного преимущества BUY или SELL — лучше ждать подтверждения")
 
     decimals = 4 if entry < 10 else 2
     q = lambda x: None if x is None else round(x, decimals)
 
     return {
         "action": action,
+        "candidate_action": candidate,
         "confidence": round(raw_conf, 4),
         "price": q(p.price),
         "entry": q(entry),
         "support": q(p.support),
         "resistance": q(p.resistance),
         "market_state": p.state,
+        "higher_timeframe_bias": higher_tf_bias,
         "stop_loss": q(stop_loss),
         "take_profit": q(take1),
         "take_profit_2": q(take2),
@@ -265,6 +307,7 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
                 "adx": round(f.adx, 2),
                 "long_score": round(f.long_score, 2),
                 "short_score": round(f.short_score, 2),
+                "bias": _frame_bias(f),
             }
             for k, f in frames.items()
         },
