@@ -7,8 +7,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from . import auto_demo_bot as bot_engine
-from .auto_demo_bot import BotError, best_suggestion, bot_status, start_bot, stop_bot
+from . import auto_demo_bot_v2 as bot_engine
+from .auto_demo_bot_v2 import BotError, best_suggestion, bot_status, start_bot, stop_bot
 from .binance_client import BinanceMarketDataError, fetch_klines
 from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
@@ -21,7 +21,7 @@ load_dotenv()
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.6")
+app = FastAPI(title="Scalping AI API", version="0.6.0")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -83,7 +83,7 @@ button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.6", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.6.0", "mode": "DEMO_AUTO", "engine": "HOLD_UNTIL_TP_SL_V2", "panel": "/panel"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
