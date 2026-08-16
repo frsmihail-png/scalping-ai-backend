@@ -243,20 +243,22 @@ async def _market_order(symbol: str, side: str, quantity: float, reduce_only: bo
     return await _request("POST", "/fapi/v1/order", params, signed=True)
 
 
-async def _protective_order(symbol: str, side: str, kind: str, trigger_price: float) -> dict:
+async def _protective_algo_order(symbol: str, side: str, kind: str, trigger_price: float) -> dict:
     params = {
+        "algoType": "CONDITIONAL",
         "symbol": symbol,
         "side": side,
         "type": kind,
-        "stopPrice": format(Decimal(str(trigger_price)).normalize(), "f"),
+        "triggerPrice": format(Decimal(str(trigger_price)).normalize(), "f"),
         "closePosition": "true",
         "workingType": "MARK_PRICE",
         "priceProtect": "TRUE",
+        "newOrderRespType": "ACK",
     }
-    return await _request("POST", "/fapi/v1/order", params, signed=True)
+    return await _request("POST", "/fapi/v1/algoOrder", params, signed=True)
 
 
-async def _cancel_open_orders(symbol: str) -> None:
+async def _cancel_standard_orders(symbol: str) -> None:
     try:
         await _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
     except BotError as exc:
@@ -265,8 +267,22 @@ async def _cancel_open_orders(symbol: str) -> None:
             raise
 
 
-async def _open_orders(symbol: str) -> list[dict]:
-    data = await _request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+async def _cancel_algo_orders(symbol: str) -> None:
+    try:
+        await _request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol}, signed=True)
+    except BotError as exc:
+        text = str(exc).lower()
+        if "unknown order" not in text and "not found" not in text and "no open algo" not in text:
+            raise
+
+
+async def _cancel_all_orders(symbol: str) -> None:
+    await _cancel_standard_orders(symbol)
+    await _cancel_algo_orders(symbol)
+
+
+async def _open_algo_orders(symbol: str) -> list[dict]:
+    data = await _request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
     return data if isinstance(data, list) else []
 
 
@@ -274,11 +290,11 @@ async def _emergency_close(symbol: str) -> None:
     positions = await _positions()
     p = next((x for x in positions if x["symbol"] == symbol), None)
     if not p:
-        await _cancel_open_orders(symbol)
+        await _cancel_all_orders(symbol)
         return
     side = "SELL" if p["position_amt"] > 0 else "BUY"
     await _market_order(symbol, side, abs(p["position_amt"]), reduce_only=True)
-    await _cancel_open_orders(symbol)
+    await _cancel_all_orders(symbol)
 
 
 def _target_price_from_margin_roi(entry: float, side: str) -> tuple[float, float]:
@@ -291,8 +307,6 @@ def _normalized_stop_pct(signal_entry: float, strategy_stop: float) -> tuple[flo
     raw = abs(signal_entry - strategy_stop) / signal_entry
     if raw > MAX_STOP_PCT:
         raise BotError(f"SL слишком далеко: {raw:.3%} > {MAX_STOP_PCT:.3%}")
-    # A signal stop that is too tight used to reject otherwise valid entries.
-    # Expand it to the configured minimum instead of silently skipping the trade.
     return max(raw, MIN_STOP_PCT), raw < MIN_STOP_PCT
 
 
@@ -331,7 +345,7 @@ async def execute_signal(signal: dict) -> dict:
     qty = await _quantity(symbol, notional, signal_entry)
 
     runtime.last_order_attempt.update({"stage": "CONFIGURE", "qty": qty, "notional": notional, "stop_pct": stop_pct})
-    await _cancel_open_orders(symbol)
+    await _cancel_all_orders(symbol)
     await _set_isolated_margin(symbol)
     await _set_leverage(symbol)
 
@@ -352,20 +366,20 @@ async def execute_signal(signal: dict) -> dict:
     tp_trigger = await _rounded_trigger(symbol, target_raw)
 
     runtime.execution_state = "SETTING_PROTECTION"
-    runtime.last_order_attempt.update({"stage": "PROTECTION", "fill_entry": fill_entry, "sl": stop_trigger, "tp": tp_trigger})
+    runtime.last_order_attempt.update({"stage": "PROTECTION_ALGO", "fill_entry": fill_entry, "sl": stop_trigger, "tp": tp_trigger})
     try:
-        sl_order = await _protective_order(symbol, exit_side, "STOP_MARKET", stop_trigger)
-        tp_order = await _protective_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
-        await asyncio.sleep(0.35)
-        active = await _open_orders(symbol)
+        sl_order = await _protective_algo_order(symbol, exit_side, "STOP_MARKET", stop_trigger)
+        tp_order = await _protective_algo_order(symbol, exit_side, "TAKE_PROFIT_MARKET", tp_trigger)
+        await asyncio.sleep(0.5)
+        active = await _open_algo_orders(symbol)
         protective = [o for o in active if o.get("type") in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}]
         if len(protective) < 2:
-            raise BotError(f"Binance подтвердил недостаточно защитных ордеров: {len(protective)}/2")
+            raise BotError(f"Binance Algo API подтвердил недостаточно защитных ордеров: {len(protective)}/2")
     except Exception as exc:
         runtime.execution_state = "EMERGENCY_CLOSE"
         runtime.last_order_attempt["protection_error"] = str(exc)
         await _emergency_close(symbol)
-        raise BotError(f"Защитные ордера не установлены, позиция аварийно закрыта: {exc}") from exc
+        raise BotError(f"Algo SL/TP не установлены, позиция аварийно закрыта: {exc}") from exc
 
     actual_notional = abs(float(position.get("position_amt", qty))) * fill_entry
     margin_used_est = actual_notional / LEVERAGE
@@ -409,7 +423,7 @@ async def _housekeeping_after_close() -> None:
         return
     positions = await _positions()
     if not any(p["symbol"] == symbol for p in positions):
-        await _cancel_open_orders(symbol)
+        await _cancel_all_orders(symbol)
         runtime.last_closed_symbol = symbol
         runtime.execution_state = "SCANNING" if runtime.enabled else "STOPPED"
 
@@ -445,7 +459,6 @@ async def _loop() -> None:
                     runtime.execution_state = "COOLDOWN"
                 else:
                     runtime.execution_state = "SCANNING"
-                    # Only clear stale execution errors after a clean scan with no entry attempt.
                     if runtime.consecutive_errors == 0:
                         runtime.last_error = None
             runtime.consecutive_errors = 0
