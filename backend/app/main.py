@@ -13,7 +13,7 @@ from .binance_client import BinanceMarketDataError, fetch_klines
 from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
 from .models import AnalyzeRequest, AnalyzeResponse
-from .panel import PANEL_HTML
+from .panel_v2 import PANEL_HTML
 from .strategy import analyze_frame, combine
 
 load_dotenv()
@@ -22,7 +22,7 @@ load_dotenv()
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.1")
+app = FastAPI(title="Scalping AI API", version="0.5.2")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -37,7 +37,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.1", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.5.2", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
@@ -52,7 +52,7 @@ async def health():
 
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
-    """Compatibility REST snapshot. The panel itself now uses direct Binance WebSocket streams."""
+    """Compatibility REST snapshot. The panel itself uses direct Binance WebSocket streams."""
     symbol = symbol.upper().strip()
     base = "https://fapi.binance.com"
     timeout = httpx.Timeout(5.0, connect=3.0)
@@ -131,32 +131,20 @@ async def bot_stop(close_position: bool = Query(default=False)):
 
 @app.post("/bot/emergency-stop", summary="EMERGENCY STOP — запретить новые входы")
 async def bot_emergency_stop():
-    """Немедленно выключает AUTO. Открытые позиции не закрывает."""
     try:
         result = await stop_bot(close_position=False)
-        return {
-            "ok": True,
-            "action": "EMERGENCY_STOP",
-            "message": "AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.",
-            "status": result,
-        }
+        return {"ok": True, "action": "EMERGENCY_STOP", "message": "AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.", "status": result}
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/bot/close-all", summary="CLOSE ALL — закрыть все сделки")
 async def bot_close_all(confirm: bool = Query(default=False)):
-    """Отключает AUTO и закрывает все DEMO Futures позиции."""
     if not confirm:
         raise HTTPException(status_code=409, detail="Для закрытия всех DEMO-позиций укажи confirm=true")
     try:
         result = await stop_bot(close_position=True)
-        return {
-            "ok": True,
-            "action": "CLOSE_ALL",
-            "message": "AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.",
-            "status": result,
-        }
+        return {"ok": True, "action": "CLOSE_ALL", "message": "AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.", "status": result}
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -166,10 +154,7 @@ async def analyze(body: AnalyzeRequest):
     intervals = ["1m", "3m", "5m", "15m"]
     try:
         rows_list = await asyncio.gather(*(fetch_klines(body.symbol, tf, 250) for tf in intervals))
-        frames = {
-            tf: analyze_frame(parse_klines(rows), tf)
-            for tf, rows in zip(intervals, rows_list)
-        }
+        frames = {tf: analyze_frame(parse_klines(rows), tf) for tf, rows in zip(intervals, rows_list)}
         result = combine(frames, primary=body.interval)
         return AnalyzeResponse(symbol=body.symbol, **result)
     except BinanceMarketDataError as exc:
