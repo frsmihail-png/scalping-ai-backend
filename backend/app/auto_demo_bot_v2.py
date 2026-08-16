@@ -28,8 +28,8 @@ MAX_DAILY_LOSS = float(os.getenv("BOT_MAX_DAILY_LOSS", "0.02"))
 MAX_MARGIN_FRACTION = float(os.getenv("BOT_MAX_MARGIN_FRACTION", "0.25"))
 SCAN_INTERVAL_SEC = int(os.getenv("BOT_SCAN_INTERVAL_SEC", "10"))
 COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "5"))
-TARGET_NET_PROFIT_USDT = float(os.getenv("BOT_TARGET_NET_PROFIT_USDT", "1.00"))
-PROFIT_SAFETY_BUFFER_USDT = float(os.getenv("BOT_PROFIT_SAFETY_BUFFER_USDT", "0.25"))
+TARGET_NET_PROFIT_USDT = float(os.getenv("BOT_TARGET_NET_PROFIT_USDT", "0.10"))
+PROFIT_SAFETY_BUFFER_USDT = float(os.getenv("BOT_PROFIT_SAFETY_BUFFER_USDT", "0.05"))
 TAKER_FEE_RATE = float(os.getenv("BOT_TAKER_FEE_RATE", "0.0005"))
 ROUNDTRIP_SLIPPAGE_RATE = float(os.getenv("BOT_ROUNDTRIP_SLIPPAGE_RATE", "0.0004"))
 MIN_STOP_PCT = float(os.getenv("BOT_MIN_STOP_PCT", "0.0015"))
@@ -293,7 +293,7 @@ async def _emergency_close(symbol: str, reason: str) -> None:
     await _cancel_all_orders(symbol)
 
 
-def _target_price_for_one_usdt(entry: float, side: str, actual_notional: float) -> tuple[float, float, float]:
+def _target_price_for_net_profit(entry: float, side: str, actual_notional: float) -> tuple[float, float, float]:
     if actual_notional <= 0:
         raise BotError("Некорректный notional для расчёта Take Profit")
     estimated_roundtrip_cost = actual_notional * ((2 * TAKER_FEE_RATE) + ROUNDTRIP_SLIPPAGE_RATE)
@@ -363,7 +363,7 @@ async def execute_signal(signal: dict) -> dict:
     actual_qty = abs(float(position.get("position_amt", qty)))
     actual_notional = actual_qty * fill_entry
     stop_trigger_raw = fill_entry * (1 - stop_pct) if side == "BUY" else fill_entry * (1 + stop_pct)
-    target_raw, target_move_pct, estimated_roundtrip_cost = _target_price_for_one_usdt(fill_entry, side, actual_notional)
+    target_raw, target_move_pct, estimated_roundtrip_cost = _target_price_for_net_profit(fill_entry, side, actual_notional)
     exit_side = "SELL" if side == "BUY" else "BUY"
     stop_trigger = await _rounded_trigger(symbol, stop_trigger_raw)
     tp_trigger = await _rounded_trigger(symbol, target_raw)
@@ -419,7 +419,7 @@ async def execute_signal(signal: dict) -> dict:
     runtime.last_entry_at = time.time()
     runtime.last_error = None
     runtime.consecutive_errors = 0
-    runtime.holding_reason = "Позиция удерживается до TAKE PROFIT (цель ≥ 1 USDT net по расчёту) или STOP LOSS. Противоположные сигналы не закрывают сделку."
+    runtime.holding_reason = "Позиция удерживается до TAKE PROFIT (цель ≈ 0.10 USDT net по расчёту) или STOP LOSS. Противоположные сигналы не закрывают сделку."
     runtime.execution_state = "HOLDING_POSITION"
     runtime.last_order_attempt.update({"stage": "DONE", "success": True})
     return trade
@@ -469,7 +469,7 @@ async def _loop() -> None:
             positions = await _positions()
             if positions:
                 runtime.execution_state = "HOLDING_POSITION"
-                runtime.holding_reason = "Ждём TAKE PROFIT с расчётной чистой целью ≥ 1 USDT или STOP LOSS. Новые BUY/SELL игнорируются до закрытия текущей позиции."
+                runtime.holding_reason = "Ждём TAKE PROFIT с расчётной чистой целью ≈ 0.10 USDT или STOP LOSS. Новые BUY/SELL игнорируются до закрытия текущей позиции."
                 runtime.last_signal = {"action": "HOLD_POSITION", "positions": positions, "exit_policy": "TP_OR_SL_ONLY"}
             else:
                 await _after_position_closed(positions)
@@ -527,7 +527,7 @@ async def start_bot() -> dict:
         runtime.last_error = None
         runtime.consecutive_errors = 0
         runtime.execution_state = "SCANNING"
-        _task = asyncio.create_task(_loop(), name="scalping-auto-demo-v2")
+        _task = asyncio.create_task(_loop(), name="scalping-auto-demo-v4")
         return await bot_status()
 
 
@@ -561,7 +561,7 @@ async def bot_status() -> dict:
         runtime.last_error = str(exc)
     return {
         "mode": "DEMO",
-        "engine": "CONTINUOUS_1_USDT_SCALPER_V3",
+        "engine": "CONTINUOUS_010_USDT_SCALPER_V4",
         "cycle_mode": "CONTINUOUS",
         "auto_enabled": runtime.enabled,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
@@ -575,7 +575,7 @@ async def bot_status() -> dict:
         "profit_safety_buffer_usdt": PROFIT_SAFETY_BUFFER_USDT,
         "taker_fee_rate_assumed": TAKER_FEE_RATE,
         "roundtrip_slippage_rate_assumed": ROUNDTRIP_SLIPPAGE_RATE,
-        "target_note": "После каждой закрытой сделки AUTO остаётся включённым и автоматически ищет следующий вход. TP рассчитывается под цель около +1 USDT net с буфером; фактический результат не гарантируется.",
+        "target_note": "После каждой закрытой сделки AUTO остаётся включённым и автоматически ищет следующий вход. TP рассчитывается под цель около +0.10 USDT net с небольшим буфером; фактический результат не гарантируется.",
         "exit_policy": "TP_OR_SL_ONLY",
         "scan_interval_sec": SCAN_INTERVAL_SEC,
         "cooldown_sec": COOLDOWN_SEC,
