@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import auto_demo_bot_v2 as bot
+from .live_pnl_ui import LIVE_PNL_SCRIPT
 
 EPS = 1e-10
 
@@ -52,8 +53,6 @@ def _reconstruct_closed_trades(symbol: str, fills: list[dict]) -> tuple[list[Clo
         signed_qty = qty if side == "BUY" else -qty
         ts = int(fill.get("time", 0) or 0)
         commission = _num(fill.get("commission"))
-        # Demo bot trades USDT-margined contracts; commissions in another asset are
-        # reported separately so we do not silently convert them at an invented FX rate.
         commission_asset = str(fill.get("commissionAsset", "USDT") or "USDT").upper()
         commission_usdt = commission if commission_asset == "USDT" else 0.0
         realized = _num(fill.get("realizedPnl"))
@@ -76,8 +75,6 @@ def _reconstruct_closed_trades(symbol: str, fills: list[dict]) -> tuple[list[Clo
 
         new_position = position + signed_qty
 
-        # The bot uses one-way mode and does not intentionally reverse a position
-        # in one order. A return to zero therefore marks a complete trade cycle.
         if abs(new_position) <= EPS:
             gross = float(cycle["realized_pnl"])
             fees = float(cycle["commission"])
@@ -98,8 +95,6 @@ def _reconstruct_closed_trades(symbol: str, fills: list[dict]) -> tuple[list[Clo
             cycle = None
             position = 0.0
         else:
-            # Defensive handling for an unexpected reversal. Finish the old cycle
-            # at this fill and start tracking the remainder as a new position.
             if position != 0 and (position > 0) != (new_position > 0):
                 gross = float(cycle["realized_pnl"])
                 fees = float(cycle["commission"])
@@ -217,3 +212,18 @@ async def performance_report(limit_per_symbol: int = 1000, recent: int = 20) -> 
         "recent_trades": recent_trades,
         "errors": errors,
     }
+
+
+def _inject_live_pnl_widget() -> None:
+    """Inject the display-only LIVE PnL widget without touching trade execution logic."""
+    import sys
+
+    main_module = sys.modules.get(f"{__package__}.main")
+    if main_module is None or not hasattr(main_module, "PANEL_HTML"):
+        return
+    html = getattr(main_module, "PANEL_HTML")
+    if "livePnlCard" not in html:
+        setattr(main_module, "PANEL_HTML", html.replace("</body>", LIVE_PNL_SCRIPT + "</body>"))
+
+
+_inject_live_pnl_widget()
