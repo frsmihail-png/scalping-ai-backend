@@ -22,8 +22,10 @@ load_dotenv()
 
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
+bot_engine.TARGET_NET_PROFIT_USDT = 0.10
+bot_engine.PROFIT_SAFETY_BUFFER_USDT = 0.05
 
-app = FastAPI(title="Scalping AI API", version="0.8.0")
+app = FastAPI(title="Scalping AI API", version="0.8.1")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -117,7 +119,7 @@ PERFORMANCE_SCRIPT = r'''
 
 @app.get("/")
 async def root():
-    return {"name":"Scalping AI API","version":"0.8.0","mode":"DEMO_AUTO","engine":"CONTINUOUS_1_USDT_SCALPER_V3","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
+    return {"name":"Scalping AI API","version":"0.8.1","mode":"DEMO_AUTO","engine":"CONTINUOUS_010_USDT_SCALPER_V4","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
