@@ -13,16 +13,15 @@ from .binance_client import BinanceMarketDataError, fetch_klines
 from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
 from .models import AnalyzeRequest, AnalyzeResponse
-from .panel_v2 import PANEL_HTML
+from .panel import PANEL_HTML
 from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-# DEMO tuning. The score is an internal strategy score, not a guaranteed win probability.
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.2")
+app = FastAPI(title="Scalping AI API", version="0.5.3")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -34,25 +33,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.2", "mode": "DEMO_AUTO", "panel": "/panel"}
-
+    return {"name": "Scalping AI API", "version": "0.5.3", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
     return HTMLResponse(content=PANEL_HTML, status_code=200)
 
-
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
-    """Compatibility REST snapshot. The panel itself uses direct Binance WebSocket streams."""
     symbol = symbol.upper().strip()
     base = "https://fapi.binance.com"
     timeout = httpx.Timeout(5.0, connect=3.0)
@@ -65,26 +59,12 @@ async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_l
         for response in (ticker_res, price_res, depth_res):
             if response.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Binance LIVE {response.status_code}: {response.text}")
-        ticker = ticker_res.json()
-        price = price_res.json()
-        depth = depth_res.json()
-        return {
-            "source": "BINANCE_LIVE_USDM_REST_SNAPSHOT",
-            "symbol": symbol,
-            "price": float(price.get("price", 0.0)),
-            "bid": float(ticker.get("bidPrice", 0.0)),
-            "bid_qty": float(ticker.get("bidQty", 0.0)),
-            "ask": float(ticker.get("askPrice", 0.0)),
-            "ask_qty": float(ticker.get("askQty", 0.0)),
-            "bids": [[float(p), float(q)] for p, q in depth.get("bids", [])],
-            "asks": [[float(p), float(q)] for p, q in depth.get("asks", [])],
-            "last_update_id": depth.get("lastUpdateId"),
-        }
+        ticker = ticker_res.json(); price = price_res.json(); depth = depth_res.json()
+        return {"source":"BINANCE_LIVE_USDM_REST_SNAPSHOT","symbol":symbol,"price":float(price.get("price",0.0)),"bid":float(ticker.get("bidPrice",0.0)),"bid_qty":float(ticker.get("bidQty",0.0)),"ask":float(ticker.get("askPrice",0.0)),"ask_qty":float(ticker.get("askQty",0.0)),"bids":[[float(p),float(q)] for p,q in depth.get("bids",[])],"asks":[[float(p),float(q)] for p,q in depth.get("asks",[])],"last_update_id":depth.get("lastUpdateId")}
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Ошибка LIVE Binance Futures: {exc}") from exc
-
 
 @app.get("/binance/demo/status")
 async def binance_demo_status(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
@@ -95,7 +75,6 @@ async def binance_demo_status(symbol: str = Query(default="BTCUSDT", min_length=
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка проверки Binance Demo: {exc}") from exc
 
-
 @app.get("/bot/suggestion")
 async def bot_suggestion():
     try:
@@ -103,15 +82,12 @@ async def bot_suggestion():
     except BotError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-
 @app.get("/bot/status")
 async def get_bot_status():
     return await bot_status()
 
-
 @app.post("/bot/start", summary="AUTO START")
 async def bot_start(confirm: bool = Query(default=False)):
-    """Запускает автоматический DEMO-скальпинг после явного подтверждения."""
     if not confirm:
         raise HTTPException(status_code=409, detail="Для запуска DEMO AUTO укажи confirm=true")
     try:
@@ -119,24 +95,20 @@ async def bot_start(confirm: bool = Query(default=False)):
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-
 @app.post("/bot/stop", summary="STOP AUTO")
 async def bot_stop(close_position: bool = Query(default=False)):
-    """Останавливает новые входы. При close_position=true также закрывает текущие позиции."""
     try:
         return await stop_bot(close_position=close_position)
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-
 @app.post("/bot/emergency-stop", summary="EMERGENCY STOP — запретить новые входы")
 async def bot_emergency_stop():
     try:
         result = await stop_bot(close_position=False)
-        return {"ok": True, "action": "EMERGENCY_STOP", "message": "AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.", "status": result}
+        return {"ok":True,"action":"EMERGENCY_STOP","message":"AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.","status":result}
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
 
 @app.post("/bot/close-all", summary="CLOSE ALL — закрыть все сделки")
 async def bot_close_all(confirm: bool = Query(default=False)):
@@ -144,10 +116,9 @@ async def bot_close_all(confirm: bool = Query(default=False)):
         raise HTTPException(status_code=409, detail="Для закрытия всех DEMO-позиций укажи confirm=true")
     try:
         result = await stop_bot(close_position=True)
-        return {"ok": True, "action": "CLOSE_ALL", "message": "AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.", "status": result}
+        return {"ok":True,"action":"CLOSE_ALL","message":"AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.","status":result}
     except BotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
