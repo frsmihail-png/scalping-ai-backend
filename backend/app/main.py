@@ -25,7 +25,21 @@ bot_engine.SCAN_INTERVAL_SEC = 10
 bot_engine.TARGET_NET_PROFIT_USDT = 0.10
 bot_engine.PROFIT_SAFETY_BUFFER_USDT = 0.05
 
-app = FastAPI(title="Scalping AI API", version="0.8.1")
+
+async def _analyze_demo_symbol_regime(symbol: str, primary: str = "1m") -> dict:
+    intervals = ["1m", "3m", "5m", "15m", "1h", "4h"]
+    rows = await asyncio.gather(*(bot_engine._klines(symbol, tf, 250) for tf in intervals))
+    frames = {tf: analyze_frame(parse_klines(item), tf) for tf, item in zip(intervals, rows)}
+    result = combine(frames, primary=primary)
+    result["symbol"] = symbol
+    return result
+
+
+# best_suggestion() resolves analyze_demo_symbol from its module globals at runtime,
+# so this replaces the old 4-timeframe scanner without duplicating the bot engine.
+bot_engine.analyze_demo_symbol = _analyze_demo_symbol_regime
+
+app = FastAPI(title="Scalping AI API", version="0.9.0")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -119,7 +133,7 @@ PERFORMANCE_SCRIPT = r'''
 
 @app.get("/")
 async def root():
-    return {"name":"Scalping AI API","version":"0.8.1","mode":"DEMO_AUTO","engine":"CONTINUOUS_010_USDT_SCALPER_V4","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
+    return {"name":"Scalping AI API","version":"0.9.0","mode":"DEMO_AUTO","engine":"CONTINUOUS_010_USDT_SCALPER_V4_REGIME_FILTER","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
@@ -145,7 +159,7 @@ async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_l
 
 @app.get("/market/klines")
 async def market_klines(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20), interval: str = Query(default="1m"), limit: int = Query(default=120, ge=30, le=500)):
-    allowed={"1m","3m","5m","15m","30m","1h"};symbol=symbol.upper().strip()
+    allowed={"1m","3m","5m","15m","30m","1h","4h","1d","1w","1M"};symbol=symbol.upper().strip()
     if interval not in allowed: raise HTTPException(status_code=400, detail="Unsupported interval")
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(6.0,connect=3.0)) as client:
@@ -202,7 +216,7 @@ async def bot_close_all(confirm: bool = Query(default=False)):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    intervals=["1m","3m","5m","15m"]
+    intervals=["1m","3m","5m","15m","1h","4h"]
     try:
         rows_list=await asyncio.gather(*(fetch_klines(body.symbol,tf,250) for tf in intervals));frames={tf:analyze_frame(parse_klines(rows),tf) for tf,rows in zip(intervals,rows_list)};result=combine(frames,primary=body.interval);return AnalyzeResponse(symbol=body.symbol,**result)
     except BinanceMarketDataError as exc: raise HTTPException(status_code=502,detail=str(exc)) from exc
