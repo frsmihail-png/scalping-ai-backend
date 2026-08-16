@@ -28,7 +28,8 @@ MAX_DAILY_LOSS = float(os.getenv("BOT_MAX_DAILY_LOSS", "0.02"))
 MAX_MARGIN_FRACTION = float(os.getenv("BOT_MAX_MARGIN_FRACTION", "0.25"))
 SCAN_INTERVAL_SEC = int(os.getenv("BOT_SCAN_INTERVAL_SEC", "10"))
 COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "30"))
-TARGET_NET_MARGIN_ROI = float(os.getenv("BOT_TARGET_NET_MARGIN_ROI", "0.01"))
+TARGET_NET_PROFIT_USDT = float(os.getenv("BOT_TARGET_NET_PROFIT_USDT", "1.00"))
+PROFIT_SAFETY_BUFFER_USDT = float(os.getenv("BOT_PROFIT_SAFETY_BUFFER_USDT", "0.25"))
 TAKER_FEE_RATE = float(os.getenv("BOT_TAKER_FEE_RATE", "0.0005"))
 ROUNDTRIP_SLIPPAGE_RATE = float(os.getenv("BOT_ROUNDTRIP_SLIPPAGE_RATE", "0.0004"))
 MIN_STOP_PCT = float(os.getenv("BOT_MIN_STOP_PCT", "0.0015"))
@@ -290,12 +291,14 @@ async def _emergency_close(symbol: str, reason: str) -> None:
     await _cancel_all_orders(symbol)
 
 
-def _target_price_from_margin_roi(entry: float, side: str) -> tuple[float, float]:
-    # Approximate price move needed for +1% return on used margin at 3x,
-    # after assumed taker fees and slippage. This is a target, not a guarantee.
-    required_price_move = TARGET_NET_MARGIN_ROI / LEVERAGE + (2 * TAKER_FEE_RATE) + ROUNDTRIP_SLIPPAGE_RATE
+def _target_price_for_one_usdt(entry: float, side: str, actual_notional: float) -> tuple[float, float, float]:
+    if actual_notional <= 0:
+        raise BotError("Некорректный notional для расчёта Take Profit")
+    estimated_roundtrip_cost = actual_notional * ((2 * TAKER_FEE_RATE) + ROUNDTRIP_SLIPPAGE_RATE)
+    gross_profit_target = TARGET_NET_PROFIT_USDT + PROFIT_SAFETY_BUFFER_USDT + estimated_roundtrip_cost
+    required_price_move = gross_profit_target / actual_notional
     tp = entry * (1 + required_price_move) if side == "BUY" else entry * (1 - required_price_move)
-    return tp, required_price_move
+    return tp, required_price_move, estimated_roundtrip_cost
 
 
 def _normalized_stop_pct(signal_entry: float, strategy_stop: float) -> tuple[float, bool]:
@@ -355,14 +358,24 @@ async def execute_signal(signal: dict) -> dict:
         await _emergency_close(symbol, "Не удалось получить фактическую цену входа")
         raise BotError("Не удалось получить фактическую цену входа")
 
+    actual_qty = abs(float(position.get("position_amt", qty)))
+    actual_notional = actual_qty * fill_entry
     stop_trigger_raw = fill_entry * (1 - stop_pct) if side == "BUY" else fill_entry * (1 + stop_pct)
-    target_raw, target_move_pct = _target_price_from_margin_roi(fill_entry, side)
+    target_raw, target_move_pct, estimated_roundtrip_cost = _target_price_for_one_usdt(fill_entry, side, actual_notional)
     exit_side = "SELL" if side == "BUY" else "BUY"
     stop_trigger = await _rounded_trigger(symbol, stop_trigger_raw)
     tp_trigger = await _rounded_trigger(symbol, target_raw)
 
     runtime.execution_state = "SETTING_PROTECTION"
-    runtime.last_order_attempt.update({"stage": "PROTECTION_ALGO", "fill_entry": fill_entry, "sl": stop_trigger, "tp": tp_trigger})
+    runtime.last_order_attempt.update({
+        "stage": "PROTECTION_ALGO",
+        "fill_entry": fill_entry,
+        "sl": stop_trigger,
+        "tp": tp_trigger,
+        "target_net_profit_usdt": TARGET_NET_PROFIT_USDT,
+        "profit_safety_buffer_usdt": PROFIT_SAFETY_BUFFER_USDT,
+        "estimated_roundtrip_cost_usdt": round(estimated_roundtrip_cost, 6),
+    })
 
     sl_order: dict | None = None
     tp_order: dict | None = None
@@ -374,19 +387,21 @@ async def execute_signal(signal: dict) -> dict:
         await _emergency_close(symbol, f"Не удалось установить полный SL/TP: {exc}")
         raise BotError(f"SL/TP не установлены, позиция аварийно закрыта: {exc}") from exc
 
-    actual_notional = abs(float(position.get("position_amt", qty))) * fill_entry
     margin_used_est = actual_notional / LEVERAGE
     trade = {
         "symbol": symbol,
         "side": side,
         "confidence_score": confidence,
-        "quantity": abs(float(position.get("position_amt", qty))),
+        "quantity": actual_qty,
         "leverage": LEVERAGE,
         "margin_type": "ISOLATED",
         "estimated_notional_usdt": round(actual_notional, 4),
         "estimated_margin_used_usdt": round(margin_used_est, 4),
         "risk_budget_usdt": round(risk_usdt, 4),
-        "target_net_margin_roi": TARGET_NET_MARGIN_ROI,
+        "target_net_profit_usdt": TARGET_NET_PROFIT_USDT,
+        "profit_safety_buffer_usdt": PROFIT_SAFETY_BUFFER_USDT,
+        "estimated_roundtrip_cost_usdt": round(estimated_roundtrip_cost, 6),
+        "target_gross_profit_usdt": round(TARGET_NET_PROFIT_USDT + PROFIT_SAFETY_BUFFER_USDT + estimated_roundtrip_cost, 6),
         "target_price_move_pct": target_move_pct,
         "entry_price": fill_entry,
         "stop_loss": stop_trigger,
@@ -402,7 +417,7 @@ async def execute_signal(signal: dict) -> dict:
     runtime.last_entry_at = time.time()
     runtime.last_error = None
     runtime.consecutive_errors = 0
-    runtime.holding_reason = "Позиция удерживается до TAKE PROFIT или STOP LOSS. Противоположные сигналы не закрывают сделку."
+    runtime.holding_reason = "Позиция удерживается до TAKE PROFIT (цель ≥ 1 USDT net по расчёту) или STOP LOSS. Противоположные сигналы не закрывают сделку."
     runtime.execution_state = "HOLDING_POSITION"
     runtime.last_order_attempt.update({"stage": "DONE", "success": True})
     return trade
@@ -436,10 +451,8 @@ async def _loop() -> None:
 
             positions = await _positions()
             if positions:
-                # Core hold policy: once a trade exists, DO NOT act on new or opposite signals.
-                # Binance-side TP/SL controls the exit. Only Emergency Stop / Close All can override this.
                 runtime.execution_state = "HOLDING_POSITION"
-                runtime.holding_reason = "Ждём TAKE PROFIT (+целевой ROI) или STOP LOSS. Новые BUY/SELL игнорируются до закрытия текущей позиции."
+                runtime.holding_reason = "Ждём TAKE PROFIT с расчётной чистой целью ≥ 1 USDT или STOP LOSS. Новые BUY/SELL игнорируются до закрытия текущей позиции."
                 runtime.last_signal = {"action": "HOLD_POSITION", "positions": positions, "exit_policy": "TP_OR_SL_ONLY"}
             else:
                 await _after_position_closed()
@@ -509,7 +522,6 @@ async def stop_bot(close_position: bool = False) -> dict:
         for p in await _positions():
             await _emergency_close(p["symbol"], "CLOSE ALL requested")
     else:
-        # STOP AUTO must not close an existing position. Existing TP/SL remain responsible for exit.
         runtime.holding_reason = "AUTO остановлен; существующая позиция оставлена под TP/SL."
     runtime.execution_state = "STOPPED"
     return await bot_status()
@@ -534,8 +546,11 @@ async def bot_status() -> dict:
         "risk_per_trade": RISK_PER_TRADE,
         "max_daily_loss": MAX_DAILY_LOSS,
         "max_margin_fraction": MAX_MARGIN_FRACTION,
-        "target_net_margin_roi": TARGET_NET_MARGIN_ROI,
-        "target_note": "Цель +1% на использованную маржу расчётная; фактическая прибыль не гарантируется из-за комиссии, проскальзывания и движения рынка.",
+        "target_net_profit_usdt": TARGET_NET_PROFIT_USDT,
+        "profit_safety_buffer_usdt": PROFIT_SAFETY_BUFFER_USDT,
+        "taker_fee_rate_assumed": TAKER_FEE_RATE,
+        "roundtrip_slippage_rate_assumed": ROUNDTRIP_SLIPPAGE_RATE,
+        "target_note": "TP рассчитывается так, чтобы после предполагаемых комиссии и проскальзывания оставалось не менее 1 USDT плюс небольшой буфер. Фактический результат не гарантируется.",
         "exit_policy": "TP_OR_SL_ONLY",
         "scan_interval_sec": SCAN_INTERVAL_SEC,
         "cooldown_sec": COOLDOWN_SEC,
