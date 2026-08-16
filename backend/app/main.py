@@ -18,11 +18,11 @@ from .strategy import analyze_frame, combine
 
 load_dotenv()
 
-# Requested DEMO tuning. The score is an internal strategy score, not a guaranteed win probability.
+# DEMO tuning. The score is an internal strategy score, not a guaranteed win probability.
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.5.0")
+app = FastAPI(title="Scalping AI API", version="0.5.1")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -37,7 +37,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.5.0", "mode": "DEMO_AUTO", "panel": "/panel"}
+    return {"name": "Scalping AI API", "version": "0.5.1", "mode": "DEMO_AUTO", "panel": "/panel"}
 
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
@@ -52,7 +52,7 @@ async def health():
 
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
-    """Public LIVE Binance USD-M Futures price and top-10 order book. Trading remains DEMO."""
+    """Compatibility REST snapshot. The panel itself now uses direct Binance WebSocket streams."""
     symbol = symbol.upper().strip()
     base = "https://fapi.binance.com"
     timeout = httpx.Timeout(5.0, connect=3.0)
@@ -69,7 +69,7 @@ async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_l
         price = price_res.json()
         depth = depth_res.json()
         return {
-            "source": "BINANCE_LIVE_USDM",
+            "source": "BINANCE_LIVE_USDM_REST_SNAPSHOT",
             "symbol": symbol,
             "price": float(price.get("price", 0.0)),
             "bid": float(ticker.get("bidPrice", 0.0)),
