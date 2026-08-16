@@ -27,7 +27,7 @@ RISK_PER_TRADE = float(os.getenv("BOT_RISK_PER_TRADE", "0.005"))
 MAX_DAILY_LOSS = float(os.getenv("BOT_MAX_DAILY_LOSS", "0.02"))
 MAX_MARGIN_FRACTION = float(os.getenv("BOT_MAX_MARGIN_FRACTION", "0.25"))
 SCAN_INTERVAL_SEC = int(os.getenv("BOT_SCAN_INTERVAL_SEC", "10"))
-COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "30"))
+COOLDOWN_SEC = int(os.getenv("BOT_COOLDOWN_SEC", "5"))
 TARGET_NET_PROFIT_USDT = float(os.getenv("BOT_TARGET_NET_PROFIT_USDT", "1.00"))
 PROFIT_SAFETY_BUFFER_USDT = float(os.getenv("BOT_PROFIT_SAFETY_BUFFER_USDT", "0.25"))
 TAKER_FEE_RATE = float(os.getenv("BOT_TAKER_FEE_RATE", "0.0005"))
@@ -51,6 +51,8 @@ class BotRuntime:
     last_error: str | None = None
     last_closed_symbol: str | None = None
     last_entry_at: float | None = None
+    last_exit_at: float | None = None
+    completed_cycles: int = 0
     execution_state: str = "STOPPED"
     last_order_attempt: dict | None = None
     consecutive_errors: int = 0
@@ -423,17 +425,32 @@ async def execute_signal(signal: dict) -> dict:
     return trade
 
 
-async def _after_position_closed() -> None:
+async def _after_position_closed(current_positions: list[dict] | None = None) -> bool:
+    """Finalize one completed scalp exactly once and arm the next scan cycle."""
     if not runtime.last_trade:
-        return
+        return False
     symbol = runtime.last_trade.get("symbol")
     if not symbol:
-        return
-    if not any(p["symbol"] == symbol for p in await _positions()):
-        await _cancel_all_orders(symbol)
-        runtime.last_closed_symbol = symbol
-        runtime.holding_reason = None
-        runtime.execution_state = "COOLDOWN" if runtime.enabled else "STOPPED"
+        runtime.last_trade = None
+        return False
+    positions = current_positions if current_positions is not None else await _positions()
+    if any(p.get("symbol") == symbol for p in positions):
+        return False
+
+    await _cancel_all_orders(symbol)
+    runtime.last_closed_symbol = symbol
+    runtime.last_exit_at = time.time()
+    runtime.completed_cycles += 1
+    runtime.holding_reason = "Сделка закрыта. Через короткую паузу бот автоматически продолжит поиск следующего входа."
+    runtime.last_signal = {
+        "action": "TRADE_CLOSED",
+        "symbol": symbol,
+        "next_action": "SCANNING",
+        "cooldown_sec": COOLDOWN_SEC,
+    }
+    runtime.last_trade = None
+    runtime.execution_state = "COOLDOWN" if runtime.enabled else "STOPPED"
+    return True
 
 
 async def _loop() -> None:
@@ -455,18 +472,25 @@ async def _loop() -> None:
                 runtime.holding_reason = "Ждём TAKE PROFIT с расчётной чистой целью ≥ 1 USDT или STOP LOSS. Новые BUY/SELL игнорируются до закрытия текущей позиции."
                 runtime.last_signal = {"action": "HOLD_POSITION", "positions": positions, "exit_policy": "TP_OR_SL_ONLY"}
             else:
-                await _after_position_closed()
-                cooldown_left = 0.0 if runtime.last_entry_at is None else max(0.0, COOLDOWN_SEC - (time.time() - runtime.last_entry_at))
+                await _after_position_closed(positions)
+                cooldown_left = 0.0 if runtime.last_exit_at is None else max(0.0, COOLDOWN_SEC - (time.time() - runtime.last_exit_at))
                 if cooldown_left > 0:
                     runtime.execution_state = "COOLDOWN"
-                    runtime.last_signal = {"action": "COOLDOWN", "cooldown_left_sec": round(cooldown_left, 1)}
+                    runtime.last_signal = {
+                        "action": "COOLDOWN",
+                        "cooldown_left_sec": round(cooldown_left, 1),
+                        "next_action": "SCANNING",
+                    }
                 else:
+                    runtime.holding_reason = None
                     runtime.execution_state = "SCANNING"
                     suggestion = await best_suggestion()
                     runtime.last_signal = suggestion
                     if suggestion.get("eligible"):
                         runtime.execution_state = "ENTRY_SIGNAL"
                         await execute_signal(suggestion)
+                    else:
+                        runtime.execution_state = "SCANNING"
             runtime.consecutive_errors = 0
         except asyncio.CancelledError:
             raise
@@ -537,7 +561,8 @@ async def bot_status() -> dict:
         runtime.last_error = str(exc)
     return {
         "mode": "DEMO",
-        "engine": "HOLD_UNTIL_TP_SL_V2",
+        "engine": "CONTINUOUS_1_USDT_SCALPER_V3",
+        "cycle_mode": "CONTINUOUS",
         "auto_enabled": runtime.enabled,
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "confidence_note": "Это внутренний score стратегии, а не гарантированная вероятность выигрыша.",
@@ -550,7 +575,7 @@ async def bot_status() -> dict:
         "profit_safety_buffer_usdt": PROFIT_SAFETY_BUFFER_USDT,
         "taker_fee_rate_assumed": TAKER_FEE_RATE,
         "roundtrip_slippage_rate_assumed": ROUNDTRIP_SLIPPAGE_RATE,
-        "target_note": "TP рассчитывается так, чтобы после предполагаемых комиссии и проскальзывания оставалось не менее 1 USDT плюс небольшой буфер. Фактический результат не гарантируется.",
+        "target_note": "После каждой закрытой сделки AUTO остаётся включённым и автоматически ищет следующий вход. TP рассчитывается под цель около +1 USDT net с буфером; фактический результат не гарантируется.",
         "exit_policy": "TP_OR_SL_ONLY",
         "scan_interval_sec": SCAN_INTERVAL_SEC,
         "cooldown_sec": COOLDOWN_SEC,
