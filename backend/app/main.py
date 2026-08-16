@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from . import auto_demo_bot_v2 as bot_engine
 from .auto_demo_bot_v2 import BotError, best_suggestion, bot_status, start_bot, stop_bot
 from .binance_client import BinanceMarketDataError, fetch_klines
+from .chart_panel import CANDLE_CHART_SCRIPT
 from .demo_status import DemoStatusError, get_demo_status
 from .indicators import parse_klines
 from .models import AnalyzeRequest, AnalyzeResponse
@@ -22,7 +23,7 @@ load_dotenv()
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 
-app = FastAPI(title="Scalping AI API", version="0.7.0")
+app = FastAPI(title="Scalping AI API", version="0.8.0")
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -72,9 +73,7 @@ button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px
     bindToggle();
     updateAutoStartButton();
     const autoEl=document.getElementById('auto');
-    if(autoEl){
-      new MutationObserver(updateAutoStartButton).observe(autoEl,{childList:true,characterData:true,subtree:true});
-    }
+    if(autoEl){new MutationObserver(updateAutoStartButton).observe(autoEl,{childList:true,characterData:true,subtree:true});}
     setInterval(function(){bindToggle();updateAutoStartButton();},1500);
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
@@ -97,52 +96,32 @@ PERFORMANCE_SCRIPT = r'''
     if(document.getElementById('performancePanel'))return;
     const host=document.querySelector('.foot')?.parentElement || document.querySelector('.wrap');
     if(!host)return;
-    const div=document.createElement('div');
-    div.id='performancePanel'; div.className='card perf-wrap';
-    div.innerHTML=`<div class="perf-head"><div><div class="perf-title">PERFORMANCE / СТАТИСТИКА</div><div class="perf-sub">Фактические закрытые сделки Binance Futures DEMO</div></div><button class="btn stop" style="padding:8px 12px" onclick="window.loadPerformance&&window.loadPerformance()">↻ ОБНОВИТЬ</button></div>
-      <div class="perf-kpis">${card('TRADES','pTrades')}${card('WIN RATE','pWinRate')}${card('NET PNL','pNet')}${card('КОМИССИИ','pFees')}${card('AVG WIN','pAvgWin')}${card('AVG LOSS','pAvgLoss')}${card('PROFIT FACTOR','pPF')}${card('EXPECTANCY','pExp')}</div>
-      <div class="perf-grid"><div><div class="label" style="margin-bottom:5px">ПО ПАРАМ</div><table class="perf-table"><thead><tr><th>Пара</th><th>Сделки</th><th>Win%</th><th>Net PnL</th><th>PF</th></tr></thead><tbody id="perfSymbols"></tbody></table></div><div><div class="label" style="margin-bottom:5px">ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ</div><table class="perf-table"><thead><tr><th>Пара</th><th>Side</th><th>Результат</th><th>Net PnL</th><th>Комиссия</th></tr></thead><tbody id="perfRecent"></tbody></table></div></div><div id="perfNote" class="perf-note">Загрузка статистики…</div>`;
-    const foot=document.querySelector('.foot');
-    if(foot)foot.parentElement.insertBefore(div,foot);else host.appendChild(div);
+    const div=document.createElement('div'); div.id='performancePanel'; div.className='card perf-wrap';
+    div.innerHTML=`<div class="perf-head"><div><div class="perf-title">PERFORMANCE / СТАТИСТИКА</div><div class="perf-sub">Фактические закрытые сделки Binance Futures DEMO</div></div><button class="btn stop" style="padding:8px 12px" onclick="window.loadPerformance&&window.loadPerformance()">↻ ОБНОВИТЬ</button></div><div class="perf-kpis">${card('TRADES','pTrades')}${card('WIN RATE','pWinRate')}${card('NET PNL','pNet')}${card('КОМИССИИ','pFees')}${card('AVG WIN','pAvgWin')}${card('AVG LOSS','pAvgLoss')}${card('PROFIT FACTOR','pPF')}${card('EXPECTANCY','pExp')}</div><div class="perf-grid"><div><div class="label" style="margin-bottom:5px">ПО ПАРАМ</div><table class="perf-table"><thead><tr><th>Пара</th><th>Сделки</th><th>Win%</th><th>Net PnL</th><th>PF</th></tr></thead><tbody id="perfSymbols"></tbody></table></div><div><div class="label" style="margin-bottom:5px">ПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ</div><table class="perf-table"><thead><tr><th>Пара</th><th>Side</th><th>Результат</th><th>Net PnL</th><th>Комиссия</th></tr></thead><tbody id="perfRecent"></tbody></table></div></div><div id="perfNote" class="perf-note">Загрузка статистики…</div>`;
+    const foot=document.querySelector('.foot'); if(foot)foot.parentElement.insertBefore(div,foot);else host.appendChild(div);
   }
   async function loadPerformance(){
-    install();
-    const note=document.getElementById('perfNote');
+    install(); const note=document.getElementById('perfNote');
     try{
-      const r=await fetch('/bot/performance?limit_per_symbol=1000&recent=12',{cache:'no-store'});
-      if(!r.ok)throw new Error(await r.text());
-      const d=await r.json(), s=d.summary||{};
-      const set=(id,val,c)=>{const e=document.getElementById(id);if(!e)return;e.textContent=val;if(c)e.className='v '+c};
-      set('pTrades',s.trades??0);
-      set('pWinRate',fmt(s.win_rate_pct,1)+'%',Number(s.win_rate_pct)>=50?'perf-good':'perf-neutral');
-      set('pNet',fmt(s.net_pnl_usdt,2)+' USDT',cls(s.net_pnl_usdt));
-      set('pFees',fmt(s.commissions_usdt,2)+' USDT','perf-neutral');
-      set('pAvgWin',fmt(s.avg_win_usdt,2)+' USDT','perf-good');
-      set('pAvgLoss',fmt(s.avg_loss_usdt,2)+' USDT','perf-bad');
-      set('pPF',pf(s.profit_factor),s.profit_factor!=null&&Number(s.profit_factor)>1?'perf-good':'perf-neutral');
-      set('pExp',fmt(s.expectancy_usdt_per_trade,3)+' USDT',cls(s.expectancy_usdt_per_trade));
-      const sy=document.getElementById('perfSymbols'); sy.innerHTML='';
-      for(const symbol of d.symbols||[]){const x=(d.by_symbol||{})[symbol]||{};const tr=document.createElement('tr');tr.innerHTML=`<td><b>${symbol}</b></td><td>${x.trades||0}</td><td>${fmt(x.win_rate_pct,1)}%</td><td class="${cls(x.net_pnl_usdt)}">${fmt(x.net_pnl_usdt,2)}</td><td>${pf(x.profit_factor)}</td>`;sy.appendChild(tr)}
-      const re=document.getElementById('perfRecent'); re.innerHTML='';
-      const recent=d.recent_trades||[];
-      if(!recent.length){re.innerHTML='<tr><td colspan="5" class="mut">Пока нет завершённых сделок</td></tr>'}else recent.forEach(x=>{const tr=document.createElement('tr');tr.innerHTML=`<td><b>${x.symbol}</b></td><td>${x.side}</td><td class="${x.result==='WIN'?'perf-good':x.result==='LOSS'?'perf-bad':'perf-neutral'}">${x.result}</td><td class="${cls(x.net_pnl)}">${fmt(x.net_pnl,3)}</td><td>${fmt(x.commission,3)}</td>`;re.appendChild(tr)});
-      if(note)note.textContent=(d.note||'')+(d.open_cycles?.length?` • Открытых циклов: ${d.open_cycles.length}`:'');
+      const r=await fetch('/bot/performance?limit_per_symbol=1000&recent=12',{cache:'no-store'}); if(!r.ok)throw new Error(await r.text());
+      const d=await r.json(),s=d.summary||{}; const set=(id,val,c)=>{const e=document.getElementById(id);if(!e)return;e.textContent=val;if(c)e.className='v '+c};
+      set('pTrades',s.trades??0);set('pWinRate',fmt(s.win_rate_pct,1)+'%',Number(s.win_rate_pct)>=50?'perf-good':'perf-neutral');set('pNet',fmt(s.net_pnl_usdt,2)+' USDT',cls(s.net_pnl_usdt));set('pFees',fmt(s.commissions_usdt,2)+' USDT','perf-neutral');set('pAvgWin',fmt(s.avg_win_usdt,2)+' USDT','perf-good');set('pAvgLoss',fmt(s.avg_loss_usdt,2)+' USDT','perf-bad');set('pPF',pf(s.profit_factor),s.profit_factor!=null&&Number(s.profit_factor)>1?'perf-good':'perf-neutral');set('pExp',fmt(s.expectancy_usdt_per_trade,3)+' USDT',cls(s.expectancy_usdt_per_trade));
+      const sy=document.getElementById('perfSymbols');sy.innerHTML='';for(const symbol of d.symbols||[]){const x=(d.by_symbol||{})[symbol]||{};const tr=document.createElement('tr');tr.innerHTML=`<td><b>${symbol}</b></td><td>${x.trades||0}</td><td>${fmt(x.win_rate_pct,1)}%</td><td class="${cls(x.net_pnl_usdt)}">${fmt(x.net_pnl_usdt,2)}</td><td>${pf(x.profit_factor)}</td>`;sy.appendChild(tr)}
+      const re=document.getElementById('perfRecent');re.innerHTML='';const recent=d.recent_trades||[];if(!recent.length){re.innerHTML='<tr><td colspan="5" class="mut">Пока нет завершённых сделок</td></tr>'}else recent.forEach(x=>{const tr=document.createElement('tr');tr.innerHTML=`<td><b>${x.symbol}</b></td><td>${x.side}</td><td class="${x.result==='WIN'?'perf-good':x.result==='LOSS'?'perf-bad':'perf-neutral'}">${x.result}</td><td class="${cls(x.net_pnl)}">${fmt(x.net_pnl,3)}</td><td>${fmt(x.commission,3)}</td>`;re.appendChild(tr)});if(note)note.textContent=(d.note||'')+(d.open_cycles?.length?` • Открытых циклов: ${d.open_cycles.length}`:'');
     }catch(e){if(note)note.textContent='Ошибка статистики: '+e.message}
   }
-  window.loadPerformance=loadPerformance;
-  function init(){install();loadPerformance();setInterval(loadPerformance,30000)}
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
+  window.loadPerformance=loadPerformance; function init(){install();loadPerformance();setInterval(loadPerformance,30000)} if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
 })();
 </script>
 '''
 
 @app.get("/")
 async def root():
-    return {"name": "Scalping AI API", "version": "0.7.0", "mode": "DEMO_AUTO", "engine": "HOLD_UNTIL_TP_SL_V2", "panel": "/panel", "performance": "/bot/performance"}
+    return {"name":"Scalping AI API","version":"0.8.0","mode":"DEMO_AUTO","engine":"CONTINUOUS_1_USDT_SCALPER_V3","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
-    html = PANEL_HTML.replace("</body>", AUTO_BUTTON_SCRIPT + PERFORMANCE_SCRIPT + "</body>")
+    html = PANEL_HTML.replace("</body>", AUTO_BUTTON_SCRIPT + CANDLE_CHART_SCRIPT + PERFORMANCE_SCRIPT + "</body>")
     return HTMLResponse(content=html, status_code=200)
 
 @app.get("/health")
@@ -151,100 +130,78 @@ async def health():
 
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
-    symbol = symbol.upper().strip()
-    base = "https://fapi.binance.com"
-    timeout = httpx.Timeout(5.0, connect=3.0)
+    symbol = symbol.upper().strip(); base = "https://fapi.binance.com"; timeout = httpx.Timeout(5.0, connect=3.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            ticker_req = client.get(f"{base}/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
-            price_req = client.get(f"{base}/fapi/v1/ticker/price", params={"symbol": symbol})
-            depth_req = client.get(f"{base}/fapi/v1/depth", params={"symbol": symbol, "limit": 10})
-            ticker_res, price_res, depth_res = await asyncio.gather(ticker_req, price_req, depth_req)
-        for response in (ticker_res, price_res, depth_res):
-            if response.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Binance LIVE {response.status_code}: {response.text}")
-        ticker = ticker_res.json(); price = price_res.json(); depth = depth_res.json()
+            ticker_req=client.get(f"{base}/fapi/v1/ticker/bookTicker",params={"symbol":symbol});price_req=client.get(f"{base}/fapi/v1/ticker/price",params={"symbol":symbol});depth_req=client.get(f"{base}/fapi/v1/depth",params={"symbol":symbol,"limit":10});ticker_res,price_res,depth_res=await asyncio.gather(ticker_req,price_req,depth_req)
+        for response in (ticker_res,price_res,depth_res):
+            if response.status_code!=200: raise HTTPException(status_code=502,detail=f"Binance LIVE {response.status_code}: {response.text}")
+        ticker=ticker_res.json();price=price_res.json();depth=depth_res.json()
         return {"source":"BINANCE_LIVE_USDM_REST_SNAPSHOT","symbol":symbol,"price":float(price.get("price",0.0)),"bid":float(ticker.get("bidPrice",0.0)),"bid_qty":float(ticker.get("bidQty",0.0)),"ask":float(ticker.get("askPrice",0.0)),"ask_qty":float(ticker.get("askQty",0.0)),"bids":[[float(p),float(q)] for p,q in depth.get("bids",[])],"asks":[[float(p),float(q)] for p,q in depth.get("asks",[])],"last_update_id":depth.get("lastUpdateId")}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Ошибка LIVE Binance Futures: {exc}") from exc
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=502,detail=f"Ошибка LIVE Binance Futures: {exc}") from exc
+
+@app.get("/market/klines")
+async def market_klines(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20), interval: str = Query(default="1m"), limit: int = Query(default=120, ge=30, le=500)):
+    allowed={"1m","3m","5m","15m","30m","1h"};symbol=symbol.upper().strip()
+    if interval not in allowed: raise HTTPException(status_code=400, detail="Unsupported interval")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0,connect=3.0)) as client:
+            r=await client.get("https://fapi.binance.com/fapi/v1/klines",params={"symbol":symbol,"interval":interval,"limit":limit})
+        if r.status_code!=200: raise HTTPException(status_code=502,detail=f"Binance klines {r.status_code}: {r.text}")
+        return [{"time":int(x[0]),"open":float(x[1]),"high":float(x[2]),"low":float(x[3]),"close":float(x[4]),"volume":float(x[5])} for x in r.json()]
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=502,detail=f"Ошибка свечей Binance: {exc}") from exc
 
 @app.get("/binance/demo/status")
 async def binance_demo_status(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
-    try:
-        return await get_demo_status(symbol)
-    except DemoStatusError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ошибка проверки Binance Demo: {exc}") from exc
+    try: return await get_demo_status(symbol)
+    except DemoStatusError as exc: raise HTTPException(status_code=502,detail=str(exc)) from exc
+    except Exception as exc: raise HTTPException(status_code=500,detail=f"Ошибка проверки Binance Demo: {exc}") from exc
 
 @app.get("/bot/suggestion")
 async def bot_suggestion():
-    try:
-        return await best_suggestion()
-    except BotError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try: return await best_suggestion()
+    except BotError as exc: raise HTTPException(status_code=502,detail=str(exc)) from exc
 
 @app.get("/bot/status")
 async def get_bot_status():
     return await bot_status()
 
 @app.get("/bot/performance", summary="Performance / Статистика")
-async def get_bot_performance(
-    limit_per_symbol: int = Query(default=1000, ge=1, le=1000),
-    recent: int = Query(default=20, ge=1, le=100),
-):
-    try:
-        return await performance_report(limit_per_symbol=limit_per_symbol, recent=recent)
-    except BotError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ошибка расчёта Performance: {exc}") from exc
+async def get_bot_performance(limit_per_symbol: int = Query(default=1000, ge=1, le=1000), recent: int = Query(default=20, ge=1, le=100)):
+    try: return await performance_report(limit_per_symbol=limit_per_symbol,recent=recent)
+    except BotError as exc: raise HTTPException(status_code=502,detail=str(exc)) from exc
+    except Exception as exc: raise HTTPException(status_code=500,detail=f"Ошибка расчёта Performance: {exc}") from exc
 
 @app.post("/bot/start", summary="AUTO START")
 async def bot_start(confirm: bool = Query(default=False)):
-    if not confirm:
-        raise HTTPException(status_code=409, detail="Для запуска DEMO AUTO укажи confirm=true")
-    try:
-        return await start_bot()
-    except BotError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not confirm: raise HTTPException(status_code=409,detail="Для запуска DEMO AUTO укажи confirm=true")
+    try: return await start_bot()
+    except BotError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 @app.post("/bot/stop", summary="STOP AUTO")
 async def bot_stop(close_position: bool = Query(default=False)):
-    try:
-        return await stop_bot(close_position=close_position)
-    except BotError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try: return await stop_bot(close_position=close_position)
+    except BotError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 @app.post("/bot/emergency-stop", summary="EMERGENCY STOP — запретить новые входы")
 async def bot_emergency_stop():
     try:
-        result = await stop_bot(close_position=False)
-        return {"ok":True,"action":"EMERGENCY_STOP","message":"AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.","status":result}
-    except BotError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result=await stop_bot(close_position=False);return {"ok":True,"action":"EMERGENCY_STOP","message":"AUTO остановлен. Новые сделки открываться не будут. Открытые позиции оставлены под существующими SL/TP.","status":result}
+    except BotError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 @app.post("/bot/close-all", summary="CLOSE ALL — закрыть все сделки")
 async def bot_close_all(confirm: bool = Query(default=False)):
-    if not confirm:
-        raise HTTPException(status_code=409, detail="Для закрытия всех DEMO-позиций укажи confirm=true")
+    if not confirm: raise HTTPException(status_code=409,detail="Для закрытия всех DEMO-позиций укажи confirm=true")
     try:
-        result = await stop_bot(close_position=True)
-        return {"ok":True,"action":"CLOSE_ALL","message":"AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.","status":result}
-    except BotError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result=await stop_bot(close_position=True);return {"ok":True,"action":"CLOSE_ALL","message":"AUTO остановлен. Команда закрытия всех открытых DEMO-позиций выполнена.","status":result}
+    except BotError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    intervals = ["1m", "3m", "5m", "15m"]
+    intervals=["1m","3m","5m","15m"]
     try:
-        rows_list = await asyncio.gather(*(fetch_klines(body.symbol, tf, 250) for tf in intervals))
-        frames = {tf: analyze_frame(parse_klines(rows), tf) for tf, rows in zip(intervals, rows_list)}
-        result = combine(frames, primary=body.interval)
-        return AnalyzeResponse(symbol=body.symbol, **result)
-    except BinanceMarketDataError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ошибка анализа: {exc}") from exc
+        rows_list=await asyncio.gather(*(fetch_klines(body.symbol,tf,250) for tf in intervals));frames={tf:analyze_frame(parse_klines(rows),tf) for tf,rows in zip(intervals,rows_list)};result=combine(frames,primary=body.interval);return AnalyzeResponse(symbol=body.symbol,**result)
+    except BinanceMarketDataError as exc: raise HTTPException(status_code=502,detail=str(exc)) from exc
+    except Exception as exc: raise HTTPException(status_code=500,detail=f"Ошибка анализа: {exc}") from exc
