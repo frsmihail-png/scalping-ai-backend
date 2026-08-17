@@ -1,11 +1,11 @@
 CANDLE_CHART_SCRIPT = r'''
 <style>
-.trade-chart-card{margin-top:8px;padding:10px 12px}.trade-chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.trade-chart-title{font-weight:900;font-size:16px}.trade-chart-meta{font-size:11px;color:var(--mut)}.trade-chart-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.trade-chart-tools select{background:#0a141e;color:#eef5fb;border:1px solid var(--line);border-radius:8px;padding:6px 8px}.chart-wrap{position:relative;height:360px;background:#07111a;border:1px solid var(--line);border-radius:10px;overflow:hidden}.chart-wrap canvas{width:100%;height:100%;display:block}.chart-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;margin-top:7px}.lg{display:inline-flex;align-items:center;gap:5px}.dot{width:9px;height:9px;border-radius:50%}.entry-dot{background:#2f9bff}.tp-dot{background:#43d78f}.sl-dot{background:#ff5d6c}.price-dot{background:#f0c94d}
+.trade-chart-card{margin-top:8px;padding:10px 12px}.trade-chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.trade-chart-title{font-weight:900;font-size:16px}.trade-chart-meta{font-size:11px;color:var(--mut)}.trade-chart-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.trade-chart-tools select{background:#0a141e;color:#eef5fb;border:1px solid var(--line);border-radius:8px;padding:6px 8px}.chart-wrap{position:relative;height:360px;background:#07111a;border:1px solid var(--line);border-radius:10px;overflow:hidden}.chart-wrap canvas{width:100%;height:100%;display:block}.chart-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;margin-top:7px}.lg{display:inline-flex;align-items:center;gap:5px}.dot{width:9px;height:9px;border-radius:50%}.entry-dot{background:#2f9bff}.tp-dot{background:#43d78f}.sl-dot{background:#ff5d6c}.price-dot{background:#f0c94d}.protection-ok{color:#43d78f}.protection-bad{color:#ff5d6c}
 @media(max-width:800px){.chart-wrap{height:300px}.trade-chart-head{align-items:flex-start;flex-direction:column}}
 </style>
 <script>
 (function(){
-  let candles=[], botState=null, selectedSymbol='BTCUSDT', interval='1m';
+  let candles=[], botState=null, protectionState=null, selectedSymbol='BTCUSDT', interval='1m';
   const fmt=n=>Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:6});
   function install(){
     if(document.getElementById('tradeChartCard'))return;
@@ -24,23 +24,46 @@ CANDLE_CHART_SCRIPT = r'''
     const rt=botState?.runtime||{};
     const p=(botState?.positions||[])[0];
     const t=rt.last_trade||{};
-    if(p){return {symbol:p.symbol||t.symbol,entry:Number(p.entry_price||t.entry_price||0),mark:Number(p.mark_price||0),tp:Number(t.take_profit||0),sl:Number(t.stop_loss||0),side:Number(p.position_amt||0)>0?'LONG':'SHORT',open:true};}
-    if(t?.symbol){return {symbol:t.symbol,entry:Number(t.entry_price||0),mark:0,tp:Number(t.take_profit||0),sl:Number(t.stop_loss||0),side:t.side==='BUY'?'LONG':'SHORT',open:false};}
+    const protection=protectionState?.protection||{};
+    const liveTp=Number(protection.take_profit||0);
+    const liveSl=Number(protection.stop_loss||0);
+    if(p){return {symbol:p.symbol||t.symbol,entry:Number(p.entry_price||t.entry_price||0),mark:Number(p.mark_price||0),tp:liveTp||Number(t.take_profit||0),sl:liveSl||Number(t.stop_loss||0),side:Number(p.position_amt||0)>0?'LONG':'SHORT',open:true,protected:Boolean(protection.protected)};}
+    if(t?.symbol){return {symbol:t.symbol,entry:Number(t.entry_price||0),mark:0,tp:liveTp||Number(t.take_profit||0),sl:liveSl||Number(t.stop_loss||0),side:t.side==='BUY'?'LONG':'SHORT',open:false,protected:Boolean(protection.protected)};}
     return null;
+  }
+  async function loadProtection(symbol){
+    try{
+      const r=await fetch(`/binance/demo/status?symbol=${encodeURIComponent(symbol)}`,{cache:'no-store'});
+      if(!r.ok)throw new Error(await r.text());
+      protectionState=await r.json();
+    }catch(e){
+      protectionState={protection:{take_profit:0,stop_loss:0,protected:false},protection_error:e.message};
+    }
   }
   async function loadChart(){
     install();
     try{
       const s=await fetch('/bot/status',{cache:'no-store'}).then(r=>r.json()); botState=s;
-      const tr=activeTrade();
+      const provisional=(botState?.positions||[])[0];
       const selector=document.querySelector('select#symbol') || document.querySelector('select');
-      selectedSymbol=(tr?.symbol || selector?.value || selectedSymbol || 'BTCUSDT').toUpperCase();
+      selectedSymbol=(provisional?.symbol || botState?.runtime?.last_trade?.symbol || selector?.value || selectedSymbol || 'BTCUSDT').toUpperCase();
+      await loadProtection(selectedSymbol);
+      const tr=activeTrade();
       const r=await fetch(`/market/klines?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(interval)}&limit=120`,{cache:'no-store'});
       if(!r.ok)throw new Error(await r.text()); candles=await r.json();
       const meta=document.getElementById('tradeChartMeta');
-      if(meta){meta.textContent=tr?`${selectedSymbol} • ${interval} • ${tr.side} • Entry ${fmt(tr.entry)} • TP ${fmt(tr.tp)} • SL ${fmt(tr.sl)}`:`${selectedSymbol} • ${interval} • нет открытой позиции`;}
+      if(meta){
+        if(tr){
+          const protectionText=tr.protected?' • TP/SL: BINANCE OK':' • TP/SL: НЕ НАЙДЕНЫ';
+          meta.className='trade-chart-meta '+(tr.protected?'protection-ok':'protection-bad');
+          meta.textContent=`${selectedSymbol} • ${interval} • ${tr.side} • Entry ${fmt(tr.entry)} • TP ${tr.tp>0?fmt(tr.tp):'—'} • SL ${tr.sl>0?fmt(tr.sl):'—'}${protectionText}`;
+        }else{
+          meta.className='trade-chart-meta';
+          meta.textContent=`${selectedSymbol} • ${interval} • нет открытой позиции`;
+        }
+      }
       draw();
-    }catch(e){const meta=document.getElementById('tradeChartMeta');if(meta)meta.textContent='Ошибка графика: '+e.message;}
+    }catch(e){const meta=document.getElementById('tradeChartMeta');if(meta){meta.className='trade-chart-meta protection-bad';meta.textContent='Ошибка графика: '+e.message;}}
   }
   function drawLine(ctx,y,text,color,w){ctx.save();ctx.strokeStyle=color;ctx.lineWidth=1.3;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(48,y);ctx.lineTo(w-8,y);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=color;ctx.font='11px sans-serif';ctx.fillText(text,52,Math.max(12,y-4));ctx.restore();}
   function draw(){
