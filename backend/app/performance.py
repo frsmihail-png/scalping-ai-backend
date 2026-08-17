@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from . import auto_demo_bot_v2 as bot
 from .live_pnl_ui import LIVE_PNL_SCRIPT
 
 EPS = 1e-10
+
+# New clean reporting window. We do NOT delete Binance Demo history; we simply
+# ignore fills closed before this baseline so the panel starts from zero for the
+# current strategy test. Can be overridden in Render with PERFORMANCE_START_AT.
+PERFORMANCE_START_AT = os.getenv("PERFORMANCE_START_AT", "2026-08-18T01:39:00+03:00")
+try:
+    PERFORMANCE_START_MS = int(datetime.fromisoformat(PERFORMANCE_START_AT).timestamp() * 1000)
+except Exception:
+    PERFORMANCE_START_MS = 0
 
 
 @dataclass
@@ -173,6 +184,12 @@ async def performance_report(limit_per_symbol: int = 1000, recent: int = 20) -> 
         try:
             fills = await _user_trades(symbol, limit_per_symbol)
             closed, open_cycle = _reconstruct_closed_trades(symbol, fills)
+
+            # Clean test window: count only trades closed after the reset point.
+            closed = [t for t in closed if t.closed_at >= PERFORMANCE_START_MS]
+            if open_cycle and int(open_cycle.get("opened_at", 0) or 0) < PERFORMANCE_START_MS:
+                open_cycle = None
+
             all_closed.extend(closed)
             by_symbol[symbol] = _metrics(closed)
             by_symbol[symbol]["fills_loaded"] = len(fills)
@@ -203,8 +220,10 @@ async def performance_report(limit_per_symbol: int = 1000, recent: int = 20) -> 
 
     return {
         "mode": "BINANCE_DEMO",
-        "scope": "ACCOUNT_USDM_TRADES_FOR_BOT_SYMBOLS",
-        "note": "Статистика реконструируется из Binance Futures userTrades. Если на DEMO-аккаунте по этим парам были ручные сделки, они тоже попадут в отчёт.",
+        "scope": "ACCOUNT_USDM_TRADES_FOR_BOT_SYMBOLS_SINCE_RESET",
+        "performance_start_at": PERFORMANCE_START_AT,
+        "performance_start_ms": PERFORMANCE_START_MS,
+        "note": "Новый отчёт считает только сделки, закрытые после точки сброса. История Binance Demo физически не удаляется.",
         "symbols": list(bot.SYMBOLS),
         "summary": summary,
         "by_symbol": by_symbol,
