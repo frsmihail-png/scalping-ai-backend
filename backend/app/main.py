@@ -20,10 +20,34 @@ from .strategy import analyze_frame, combine
 
 load_dotenv()
 
+# Canonical scalping profile. These values deliberately override stale Render
+# environment variables so the running service cannot silently fall back to $1.
 bot_engine.CONFIDENCE_THRESHOLD = 0.77
 bot_engine.SCAN_INTERVAL_SEC = 10
 bot_engine.TARGET_NET_PROFIT_USDT = 0.10
 bot_engine.PROFIT_SAFETY_BUFFER_USDT = 0.05
+
+
+def _fixed_target_price_for_net_profit(entry: float, side: str, actual_notional: float, stop_pct: float):
+    """Calculate a TP whose estimated post-cost result is $0.10 + safety buffer.
+
+    The old adaptive target could expand to $1+ when stop risk was large. For the
+    requested high-frequency demo profile the target is intentionally fixed.
+    """
+    if actual_notional <= 0:
+        raise BotError("Некорректный notional для расчёта Take Profit")
+    estimated_roundtrip_cost = actual_notional * (
+        (2 * bot_engine.TAKER_FEE_RATE) + bot_engine.ROUNDTRIP_SLIPPAGE_RATE
+    )
+    target_net = 0.10
+    gross_profit_target = target_net + bot_engine.PROFIT_SAFETY_BUFFER_USDT + estimated_roundtrip_cost
+    required_price_move = gross_profit_target / actual_notional
+    tp = entry * (1 + required_price_move) if side == "BUY" else entry * (1 - required_price_move)
+    return tp, required_price_move, estimated_roundtrip_cost, target_net
+
+
+# execute_signal() resolves this function from its module globals at runtime.
+bot_engine._target_price_for_net_profit = _fixed_target_price_for_net_profit
 
 
 async def _analyze_demo_symbol_regime(symbol: str, primary: str = "1m") -> dict:
@@ -35,11 +59,91 @@ async def _analyze_demo_symbol_regime(symbol: str, primary: str = "1m") -> dict:
     return result
 
 
-# best_suggestion() resolves analyze_demo_symbol from its module globals at runtime,
-# so this replaces the old 4-timeframe scanner without duplicating the bot engine.
+# best_suggestion() resolves analyze_demo_symbol from its module globals at runtime.
 bot_engine.analyze_demo_symbol = _analyze_demo_symbol_regime
 
-app = FastAPI(title="Scalping AI API", version="0.9.0")
+app = FastAPI(title="Scalping AI API", version="0.10.0")
+
+_profit_guard_task: asyncio.Task | None = None
+
+
+async def _profit_guard_loop() -> None:
+    """Second line of defence for the fixed 10-cent net target.
+
+    Binance conditional TP remains installed on every position. In parallel this
+    guard checks unrealized PnL once per second and closes the position with a
+    reduce-only MARKET order as soon as estimated net PnL reaches $0.10 plus a
+    $0.05 reserve. This prevents a stale/missing algo TP from letting a profitable
+    scalp drift back into a loss.
+    """
+    while True:
+        try:
+            if bot_engine.runtime.enabled:
+                positions = await bot_engine._positions()
+                for p in positions:
+                    symbol = str(p.get("symbol") or "")
+                    if symbol not in bot_engine.SYMBOLS:
+                        continue
+                    qty = abs(float(p.get("position_amt") or 0.0))
+                    entry = float(p.get("entry_price") or 0.0)
+                    gross_pnl = float(p.get("unrealized_profit") or 0.0)
+                    if qty <= 0 or entry <= 0:
+                        continue
+                    notional = qty * entry
+                    estimated_roundtrip_cost = notional * (
+                        (2 * bot_engine.TAKER_FEE_RATE) + bot_engine.ROUNDTRIP_SLIPPAGE_RATE
+                    )
+                    estimated_net = gross_pnl - estimated_roundtrip_cost
+                    close_threshold = bot_engine.TARGET_NET_PROFIT_USDT + bot_engine.PROFIT_SAFETY_BUFFER_USDT
+                    if estimated_net >= close_threshold:
+                        side = "SELL" if float(p.get("position_amt") or 0.0) > 0 else "BUY"
+                        bot_engine.runtime.execution_state = "PROFIT_LOCK"
+                        bot_engine.runtime.last_signal = {
+                            "action": "PROFIT_LOCK",
+                            "symbol": symbol,
+                            "gross_pnl_usdt": round(gross_pnl, 6),
+                            "estimated_cost_usdt": round(estimated_roundtrip_cost, 6),
+                            "estimated_net_pnl_usdt": round(estimated_net, 6),
+                            "target_net_profit_usdt": 0.10,
+                            "buffer_usdt": 0.05,
+                        }
+                        try:
+                            await bot_engine._market_order(symbol, side, qty, reduce_only=True)
+                            await bot_engine._cancel_all_orders(symbol)
+                            bot_engine.runtime.last_exit_at = __import__("time").time()
+                            bot_engine.runtime.holding_reason = "Прибыль зафиксирована PROFIT LOCK. Переходим к следующему циклу поиска."
+                        except Exception as exc:
+                            # The exchange TP may have triggered during the same second.
+                            # Re-check before treating the situation as an error.
+                            still_open = any(x.get("symbol") == symbol for x in await bot_engine._positions())
+                            if still_open:
+                                bot_engine.runtime.last_error = f"PROFIT LOCK не смог закрыть {symbol}: {exc}"
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            bot_engine.runtime.last_error = f"Profit guard: {exc}"
+            await asyncio.sleep(2.0)
+
+
+@app.on_event("startup")
+async def _start_profit_guard() -> None:
+    global _profit_guard_task
+    if _profit_guard_task is None or _profit_guard_task.done():
+        _profit_guard_task = asyncio.create_task(_profit_guard_loop(), name="profit-lock-010")
+
+
+@app.on_event("shutdown")
+async def _stop_profit_guard() -> None:
+    global _profit_guard_task
+    if _profit_guard_task and not _profit_guard_task.done():
+        _profit_guard_task.cancel()
+        try:
+            await _profit_guard_task
+        except asyncio.CancelledError:
+            pass
+    _profit_guard_task = None
+
 
 origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
 origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
@@ -97,6 +201,32 @@ button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px
 </script>
 '''
 
+TARGET_COMPAT_SCRIPT = r'''
+<script>
+(function(){
+  // Older panel code used a $1 fallback when the API field name changed.
+  // Keep the UI visibly aligned with the canonical backend target.
+  function fixTargetLabels(){
+    const nodes=[...document.querySelectorAll('div,span,b')];
+    for(const n of nodes){
+      const t=(n.textContent||'').trim().toUpperCase();
+      if(t==='ЦЕЛЬ ЧИСТЫМИ'){
+        const box=n.closest('.stat,.card,div');
+        if(box){
+          const candidates=[...box.querySelectorAll('div,span,b')];
+          for(const c of candidates){
+            if(/^\+?1([,.]00)?\s*USDT$/i.test((c.textContent||'').trim())) c.textContent='+0,10 USDT';
+          }
+        }
+      }
+    }
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',fixTargetLabels);else fixTargetLabels();
+  setInterval(fixTargetLabels,1500);
+})();
+</script>
+'''
+
 PERFORMANCE_SCRIPT = r'''
 <style>
 .perf-wrap{margin-top:8px}.perf-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}.perf-title{font-size:18px;font-weight:900}.perf-sub{font-size:11px;color:var(--mut)}.perf-kpis{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}.perf-kpi{background:#09131c;border:1px solid var(--line);border-radius:9px;padding:9px}.perf-kpi .v{font-size:19px;font-weight:900;margin-top:3px}.perf-grid{display:grid;grid-template-columns:1fr 1.2fr;gap:8px;margin-top:8px}.perf-table{width:100%;border-collapse:collapse;font-size:12px}.perf-table th,.perf-table td{padding:7px 6px;border-bottom:1px solid #172838;text-align:right}.perf-table th:first-child,.perf-table td:first-child{text-align:left}.perf-note{font-size:10px;color:var(--mut);margin-top:7px}.perf-good{color:var(--green)}.perf-bad{color:var(--red)}.perf-neutral{color:var(--amber)}
@@ -133,16 +263,16 @@ PERFORMANCE_SCRIPT = r'''
 
 @app.get("/")
 async def root():
-    return {"name":"Scalping AI API","version":"0.9.0","mode":"DEMO_AUTO","engine":"CONTINUOUS_010_USDT_SCALPER_V4_REGIME_FILTER","panel":"/panel","performance":"/bot/performance","chart":"/market/klines"}
+    return {"name":"Scalping AI API","version":"0.10.0","mode":"DEMO_AUTO","engine":"QUALITY_FIRST_SCALPER_V5_FIXED_010","panel":"/panel","performance":"/bot/performance","chart":"/market/klines","target_net_profit_usdt":0.10,"profit_lock":True}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
-    html = PANEL_HTML.replace("</body>", AUTO_BUTTON_SCRIPT + CANDLE_CHART_SCRIPT + PERFORMANCE_SCRIPT + "</body>")
+    html = PANEL_HTML.replace("</body>", AUTO_BUTTON_SCRIPT + TARGET_COMPAT_SCRIPT + CANDLE_CHART_SCRIPT + PERFORMANCE_SCRIPT + "</body>")
     return HTMLResponse(content=html, status_code=200)
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "profit_guard": bool(_profit_guard_task and not _profit_guard_task.done()), "target_net_profit_usdt": 0.10}
 
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
@@ -182,7 +312,14 @@ async def bot_suggestion():
 
 @app.get("/bot/status")
 async def get_bot_status():
-    return await bot_status()
+    data = await bot_status()
+    # Backward-compatible names for the existing panel and mobile WebView.
+    data["target_net_profit_usdt"] = 0.10
+    data["target_net_profit_floor_usdt"] = 0.10
+    data["profit_safety_buffer_usdt"] = 0.05
+    data["profit_lock_enabled"] = True
+    data["profit_lock_threshold_estimated_net_usdt"] = 0.15
+    return data
 
 @app.get("/bot/performance", summary="Performance / Статистика")
 async def get_bot_performance(limit_per_symbol: int = Query(default=1000, ge=1, le=1000), recent: int = Query(default=20, ge=1, le=100)):
