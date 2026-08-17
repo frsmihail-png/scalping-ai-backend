@@ -34,6 +34,10 @@ class FrameAnalysis:
     volume_ratio: float
     support: float
     resistance: float
+    support_touches: int
+    resistance_touches: int
+    support_retest: bool
+    resistance_retest: bool
     stoch_k: float
     stoch_d: float
     stoch_rsi: float
@@ -54,6 +58,33 @@ class FrameAnalysis:
     short_score: float
 
 
+def _count_level_touches(candles: Sequence[Candle], level: float, tolerance: float, kind: str) -> int:
+    if level <= 0 or tolerance <= 0:
+        return 0
+    touches = 0
+    last_idx = -10
+    subset = list(candles[-120:])
+    for i, c in enumerate(subset):
+        value = c.low if kind == "support" else c.high
+        if abs(value - level) <= tolerance and i - last_idx >= 2:
+            touches += 1
+            last_idx = i
+    return touches
+
+
+def _detect_retest(candles: Sequence[Candle], level: float, tolerance: float, kind: str) -> bool:
+    if len(candles) < 8 or level <= 0 or tolerance <= 0:
+        return False
+    recent = list(candles[-8:])
+    if kind == "support":
+        broke = any(c.close < level - tolerance for c in recent[:-2])
+        reclaimed = recent[-1].close > level and recent[-1].low <= level + tolerance
+        return bool(broke and reclaimed)
+    broke = any(c.close > level + tolerance for c in recent[:-2])
+    rejected = recent[-1].close < level and recent[-1].high >= level - tolerance
+    return bool(broke and rejected)
+
+
 def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     closes = [c.close for c in candles]
     price = closes[-1]
@@ -68,6 +99,11 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     vw = vwap(candles, 50)
     vr = volume_ratio(candles, 20)
     support, resistance = support_resistance(candles, 80)
+    level_tol = max(av * 0.18, price * 0.00035)
+    support_touches = _count_level_touches(candles, support, level_tol, "support")
+    resistance_touches = _count_level_touches(candles, resistance, level_tol, "resistance")
+    support_retest = _detect_retest(candles, support, level_tol, "support")
+    resistance_retest = _detect_retest(candles, resistance, level_tol, "resistance")
     sk, sd = stochastic(candles, 14)
     srsi = stoch_rsi(closes, 14)
     cc = cci(candles, 20)
@@ -95,8 +131,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     long_score = 0.0
     short_score = 0.0
 
-    # Trend block: dominant block. Trend signals receive more weight than
-    # oscillators so the bot does not constantly fade a strong move.
     if e9 > e21:
         long_score += 10
     else:
@@ -123,7 +157,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
         elif mdi > pdi:
             short_score += 8
 
-    # Momentum block. In a trend, momentum must confirm the direction.
     if mh > 0:
         long_score += 7
     elif mh < 0:
@@ -145,8 +178,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     elif cc < -50:
         short_score += 3
 
-    # Mean-reversion oscillators are only allowed to matter in RANGE/MIXED.
-    # Previously they could fight a strong trend and create wrong-way entries.
     if state in {"RANGE", "MIXED"} and ax < 24:
         if srsi < 15:
             long_score += 2
@@ -157,7 +188,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
         elif wr > -15:
             short_score += 2
 
-    # Volume / money-flow block.
     if price > vw:
         long_score += 6
     else:
@@ -180,9 +210,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
         else:
             short_score += 5
 
-    # Volatility / location. Mean reversion at Bollinger/Keltner extremes is
-    # only useful in range-like markets. In trends an outer-band touch can be
-    # continuation, so do not automatically trade against it.
     if state in {"RANGE", "MIXED"} and ax < 24:
         if price <= bbl or price <= kcl:
             long_score += 3
@@ -195,7 +222,6 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
     elif state == "DOWNTREND" and price <= bbm:
         short_score += 2
 
-    # Price action.
     if pattern in {"BULL_ENGULFING", "BULL_PIN", "BULL_IMPULSE"}:
         long_score += 6
     elif pattern in {"BEAR_ENGULFING", "BEAR_PIN", "BEAR_IMPULSE"}:
@@ -211,10 +237,22 @@ def analyze_frame(candles: Sequence[Candle], interval: str) -> FrameAnalysis:
             long_score -= 12
             short_score += 2
 
+    if support_touches >= 3 and av > 0 and distance_support < 0.9 * av:
+        long_score += min(6, support_touches)
+        short_score -= 4
+    if resistance_touches >= 3 and av > 0 and distance_resistance < 0.9 * av:
+        short_score += min(6, resistance_touches)
+        long_score -= 4
+    if support_retest:
+        long_score += 7
+    if resistance_retest:
+        short_score += 7
+
     return FrameAnalysis(
         interval, price, e9, e21, e50, e200, rv, m, ms, mh, ax, pdi, mdi, av,
-        bbl, bbm, bbh, bbw, vw, vr, support, resistance, sk, sd, srsi, cc, rc,
-        wr, obv_slope, mf, cf, kcl, kcm, kch, st_bias, ichi_bias, pattern,
+        bbl, bbm, bbh, bbw, vw, vr, support, resistance, support_touches,
+        resistance_touches, support_retest, resistance_retest, sk, sd, srsi, cc,
+        rc, wr, obv_slope, mf, cf, kcl, kcm, kch, st_bias, ichi_bias, pattern,
         state, max(long_score, 0.0), max(short_score, 0.0),
     )
 
@@ -228,6 +266,87 @@ def _frame_bias(frame: FrameAnalysis | None) -> str:
     if frame.state == "DOWNTREND" or diff <= -12:
         return "SHORT"
     return "NEUTRAL"
+
+
+def _cluster_levels(frames: Dict[str, FrameAnalysis], side: str, price: float, base_atr: float) -> List[dict]:
+    tf_weight = {"1m": 1.0, "3m": 1.15, "5m": 1.3, "15m": 1.55, "1h": 2.0, "4h": 2.5}
+    raw: List[dict] = []
+    for tf, frame in frames.items():
+        level = frame.support if side == "support" else frame.resistance
+        if level <= 0:
+            continue
+        if side == "support" and level >= price:
+            continue
+        if side == "resistance" and level <= price:
+            continue
+        touches = frame.support_touches if side == "support" else frame.resistance_touches
+        retest = frame.support_retest if side == "support" else frame.resistance_retest
+        strength = tf_weight.get(tf, 1.0) + min(touches, 5) * 0.45 + (1.2 if retest else 0.0)
+        raw.append({"price": level, "strength": strength, "tf": tf, "touches": touches, "retest": retest})
+
+    if not raw:
+        return []
+
+    tolerance = max(base_atr * 0.35, price * 0.0007)
+    clusters: List[dict] = []
+    for item in sorted(raw, key=lambda x: x["price"]):
+        matched = None
+        for cluster in clusters:
+            if abs(item["price"] - cluster["price"]) <= tolerance:
+                matched = cluster
+                break
+        if matched is None:
+            clusters.append({
+                "price": item["price"],
+                "strength": item["strength"],
+                "timeframes": [item["tf"]],
+                "touches": item["touches"],
+                "retest": item["retest"],
+            })
+        else:
+            total = matched["strength"] + item["strength"]
+            matched["price"] = (matched["price"] * matched["strength"] + item["price"] * item["strength"]) / total
+            matched["strength"] = total
+            matched["timeframes"].append(item["tf"])
+            matched["touches"] += item["touches"]
+            matched["retest"] = matched["retest"] or item["retest"]
+
+    for cluster in clusters:
+        cluster["distance"] = abs(price - cluster["price"])
+        cluster["distance_atr"] = cluster["distance"] / base_atr if base_atr > 0 else None
+        cluster["strength"] = round(cluster["strength"], 2)
+        cluster["price"] = round(cluster["price"], 8)
+    return sorted(clusters, key=lambda x: x["distance"])
+
+
+def _support_resistance_engine(frames: Dict[str, FrameAnalysis], primary: FrameAnalysis) -> dict:
+    supports = _cluster_levels(frames, "support", primary.price, primary.atr)
+    resistances = _cluster_levels(frames, "resistance", primary.price, primary.atr)
+    nearest_support = supports[0] if supports else None
+    nearest_resistance = resistances[0] if resistances else None
+
+    strong_support = bool(
+        nearest_support and nearest_support["strength"] >= 3.5 and
+        (nearest_support["distance_atr"] is None or nearest_support["distance_atr"] <= 1.0)
+    )
+    strong_resistance = bool(
+        nearest_resistance and nearest_resistance["strength"] >= 3.5 and
+        (nearest_resistance["distance_atr"] is None or nearest_resistance["distance_atr"] <= 1.0)
+    )
+
+    support_retest = any(x["retest"] and x["distance_atr"] is not None and x["distance_atr"] <= 1.2 for x in supports[:3])
+    resistance_retest = any(x["retest"] and x["distance_atr"] is not None and x["distance_atr"] <= 1.2 for x in resistances[:3])
+
+    return {
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "strong_support_nearby": strong_support,
+        "strong_resistance_nearby": strong_resistance,
+        "support_retest": support_retest,
+        "resistance_retest": resistance_retest,
+        "support_clusters": supports[:5],
+        "resistance_clusters": resistances[:5],
+    }
 
 
 def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
@@ -257,13 +376,20 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
     else:
         higher_tf_bias = "NEUTRAL"
 
+    sr = _support_resistance_engine(frames, p)
+    ns = sr["nearest_support"]
+    nr = sr["nearest_resistance"]
+
+    if sr["support_retest"]:
+        long_total += 6
+    if sr["resistance_retest"]:
+        short_total += 6
+
     dominant = max(long_total, short_total)
     diff = abs(long_total - short_total)
     raw_conf = min(0.96, max(0.50, dominant / 100.0))
 
     candidate = "HOLD"
-    # More selective than V2.0: require a material score gap and at least 77%
-    # raw confidence before a direction can become executable.
     if diff >= 18 and raw_conf >= 0.77:
         candidate = "BUY" if long_total > short_total else "SELL"
 
@@ -284,7 +410,6 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         raw_conf = min(raw_conf, 0.72)
         warnings.append("1h и 4h конфликтуют")
 
-    # If higher timeframes are neutral, require unusually strong agreement.
     if candidate in {"BUY", "SELL"} and higher_tf_bias == "NEUTRAL":
         same_side = bullish if candidate == "BUY" else bearish
         if same_side < max(5, agreement_needed):
@@ -305,9 +430,6 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         raw_conf = min(raw_conf, 0.75)
         warnings.append("SHORT запоздал: RSI/StochRSI перепроданы")
 
-    # Do not enter against the immediate 1m/3m impulse. This is deliberately a
-    # veto, not a mirror switch: blindly reversing a losing strategy does not
-    # remove fees, slippage or bad timing.
     f1 = frames.get("1m")
     f3 = frames.get("3m")
     if action == "BUY" and f1 and f3 and f1.macd_hist < 0 and f3.macd_hist < 0:
@@ -319,6 +441,22 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         raw_conf = min(raw_conf, 0.76)
         warnings.append("SELL заблокирован: импульс 1m/3m ещё вверх")
 
+    if action == "BUY" and sr["strong_resistance_nearby"] and nr:
+        action = "HOLD"
+        raw_conf = min(raw_conf, 0.76)
+        warnings.append(f"BUY заблокирован: сильное сопротивление {nr['price']} рядом")
+    if action == "SELL" and sr["strong_support_nearby"] and ns:
+        action = "HOLD"
+        raw_conf = min(raw_conf, 0.76)
+        warnings.append(f"SELL заблокирован: сильная поддержка {ns['price']} рядом")
+
+    if action == "BUY" and sr["support_retest"]:
+        raw_conf = min(0.96, raw_conf + 0.03)
+        reasons.append("Подтверждён ретест поддержки")
+    if action == "SELL" and sr["resistance_retest"]:
+        raw_conf = min(0.96, raw_conf + 0.03)
+        reasons.append("Подтверждён ретест сопротивления")
+
     reasons += [
         f"EMA trend: {'LONG' if p.ema9 > p.ema21 else 'SHORT'}",
         f"SuperTrend: {p.supertrend_bias}",
@@ -329,19 +467,22 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         f"Pattern: {p.candle_pattern}",
         f"HTF: 1h={h1_bias}, 4h={h4_bias}",
         f"Consensus: LONG {bullish}/{len(frames)}, SHORT {bearish}/{len(frames)}",
+        f"S/R: support={ns['price'] if ns else None}, resistance={nr['price'] if nr else None}",
     ]
 
     entry = p.price
     stop_loss = take1 = take2 = take3 = rr = None
     if action == "BUY":
-        risk = max(p.atr * 1.0, entry - p.support if p.support < entry else 0.0, p.atr * 0.7)
+        structural_support = ns["price"] if ns else p.support
+        risk = max(p.atr * 0.7, entry - structural_support if structural_support < entry else 0.0)
         stop_loss = entry - risk
         take1 = entry + risk * 1.3
         take2 = entry + risk * 2.0
         take3 = entry + risk * 3.0
         rr = 1.3
     elif action == "SELL":
-        risk = max(p.atr * 1.0, p.resistance - entry if p.resistance > entry else 0.0, p.atr * 0.7)
+        structural_resistance = nr["price"] if nr else p.resistance
+        risk = max(p.atr * 0.7, structural_resistance - entry if structural_resistance > entry else 0.0)
         stop_loss = entry + risk
         take1 = entry - risk * 1.3
         take2 = entry - risk * 2.0
@@ -383,6 +524,10 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         "supertrend_bias": p.supertrend_bias,
         "ichimoku_bias": p.ichimoku_bias,
         "candle_pattern": p.candle_pattern,
+        "support_touches": p.support_touches,
+        "resistance_touches": p.resistance_touches,
+        "support_retest": p.support_retest,
+        "resistance_retest": p.resistance_retest,
         "long_score": round(long_total, 2),
         "short_score": round(short_total, 2),
         "ml_samples": 0.0,
@@ -391,7 +536,7 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
     mirror_shadow_action = "SELL" if candidate == "BUY" else "BUY" if candidate == "SELL" else "HOLD"
 
     return {
-        "strategy_engine": "V2.1_QUALITY_FIRST",
+        "strategy_engine": "V2.2_SR_ENGINE",
         "action": action,
         "candidate_action": candidate,
         "mirror_shadow_action": mirror_shadow_action,
@@ -400,6 +545,7 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
         "entry": q(entry),
         "support": q(p.support),
         "resistance": q(p.resistance),
+        "support_resistance_engine": sr,
         "market_state": p.state,
         "higher_timeframe_bias": higher_tf_bias,
         "stop_loss": q(stop_loss),
@@ -420,6 +566,12 @@ def combine(frames: Dict[str, FrameAnalysis], primary: str = "1m") -> dict:
                 "bias": _frame_bias(f),
                 "supertrend": f.supertrend_bias,
                 "ichimoku": f.ichimoku_bias,
+                "support": q(f.support),
+                "resistance": q(f.resistance),
+                "support_touches": f.support_touches,
+                "resistance_touches": f.resistance_touches,
+                "support_retest": f.support_retest,
+                "resistance_retest": f.resistance_retest,
             }
             for k, f in frames.items()
         },
