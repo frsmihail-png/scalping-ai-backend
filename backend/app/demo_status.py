@@ -52,11 +52,61 @@ def _num(value) -> float:
 
 
 def _trigger_price(order: dict) -> float:
-    for key in ("triggerPrice", "stopPrice", "activatePrice", "price"):
+    for key in ("triggerPrice", "stopPrice", "activatePrice", "activationPrice", "price"):
         value = _num(order.get(key))
         if value > 0:
             return value
     return 0.0
+
+
+def _normalize_orders(data) -> list[dict]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("orders", "data", "rows", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+        # Some environments return one order object directly.
+        if data.get("symbol") and (data.get("type") or data.get("orderType")):
+            return [data]
+    return []
+
+
+async def _load_protection_orders(symbol: str) -> tuple[list[dict], str, list[str]]:
+    """Query protection orders using current and legacy Binance Demo variants.
+
+    Binance Demo has changed conditional-order endpoints over time. We try the
+    dedicated algo endpoint first, then compatible fallbacks. This also lets
+    the UI recover TP/SL after a Render restart because the source of truth is
+    Binance, not runtime.last_trade.
+    """
+    attempts: list[str] = []
+    candidates = [
+        ("/fapi/v1/algoOpenOrders", {"symbol": symbol}),
+        ("/fapi/v1/openAlgoOrders", {"symbol": symbol}),
+        ("/fapi/v1/openOrders", {"symbol": symbol}),
+    ]
+    combined: list[dict] = []
+    source = ""
+    seen: set[str] = set()
+
+    for path, params in candidates:
+        try:
+            data = await _signed_get(path, params)
+            orders = _normalize_orders(data)
+            attempts.append(f"{path}:ok:{len(orders)}")
+            if orders and not source:
+                source = path
+            for order in orders:
+                key = str(order.get("algoId") or order.get("orderId") or order.get("clientAlgoId") or order)
+                if key not in seen:
+                    seen.add(key)
+                    combined.append(order)
+        except DemoStatusError as exc:
+            attempts.append(f"{path}:error:{exc}")
+
+    return combined, source or "NO_OPEN_ORDER_SOURCE", attempts
 
 
 async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
@@ -70,7 +120,6 @@ async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
     if not result["credentials_present"]:
         return result
 
-    # Binance has used both v2 and v3 account endpoints over time; try v3 first.
     try:
         balances = await _signed_get("/fapi/v3/balance")
     except DemoStatusError:
@@ -82,29 +131,26 @@ async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
         "available_balance": float(usdt.get("availableBalance", 0)) if usdt else 0.0,
     }
 
-    # Restore protection information directly from Binance. This survives a Render
-    # restart/deploy even when the in-memory runtime.last_trade is empty.
-    try:
-        algo_orders = await _signed_get("/fapi/v1/algoOpenOrders", {"symbol": symbol})
-        if not isinstance(algo_orders, list):
-            algo_orders = []
-    except DemoStatusError as exc:
-        algo_orders = []
-        result["protection_error"] = str(exc)
+    algo_orders, source, attempts = await _load_protection_orders(symbol)
 
     tp = 0.0
     sl = 0.0
     protection_orders: list[dict] = []
     for order in algo_orders:
-        kind = str(order.get("type") or order.get("orderType") or "").upper()
+        kind = str(order.get("type") or order.get("orderType") or order.get("origType") or "").upper()
         trigger = _trigger_price(order)
+        status = str(order.get("status") or order.get("algoStatus") or "").upper()
+        # Ignore clearly finished/cancelled rows if a fallback endpoint returns history.
+        if status in {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+            continue
         compact = {
             "type": kind,
             "side": str(order.get("side", "")).upper(),
             "trigger_price": trigger,
-            "status": order.get("status"),
-            "algo_id": order.get("algoId") or order.get("clientAlgoId"),
+            "status": status or order.get("status"),
+            "algo_id": order.get("algoId") or order.get("clientAlgoId") or order.get("orderId"),
             "close_position": order.get("closePosition"),
+            "reduce_only": order.get("reduceOnly"),
         }
         protection_orders.append(compact)
         if "TAKE_PROFIT" in kind and trigger > 0:
@@ -117,6 +163,9 @@ async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
         "stop_loss": sl,
         "protected": bool(tp > 0 and sl > 0),
         "open_algo_orders": protection_orders,
-        "source": "BINANCE_DEMO_ALGO_OPEN_ORDERS",
+        "source": source,
+        "query_attempts": attempts,
     }
+    if tp <= 0 or sl <= 0:
+        result["protection_warning"] = "Открытая защита TP/SL не обнаружена полностью. Проверь условные ордера Binance Demo."
     return result
