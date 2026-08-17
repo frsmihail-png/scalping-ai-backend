@@ -29,11 +29,7 @@ bot_engine.PROFIT_SAFETY_BUFFER_USDT = 0.05
 
 
 def _fixed_target_price_for_net_profit(entry: float, side: str, actual_notional: float, stop_pct: float):
-    """Calculate a TP whose estimated post-cost result is $0.10 + safety buffer.
-
-    The old adaptive target could expand to $1+ when stop risk was large. For the
-    requested high-frequency demo profile the target is intentionally fixed.
-    """
+    """Calculate exchange TP with a small execution reserve around a $0.10 net target."""
     if actual_notional <= 0:
         raise BotError("Некорректный notional для расчёта Take Profit")
     estimated_roundtrip_cost = actual_notional * (
@@ -62,19 +58,18 @@ async def _analyze_demo_symbol_regime(symbol: str, primary: str = "1m") -> dict:
 # best_suggestion() resolves analyze_demo_symbol from its module globals at runtime.
 bot_engine.analyze_demo_symbol = _analyze_demo_symbol_regime
 
-app = FastAPI(title="Scalping AI API", version="0.10.0")
+app = FastAPI(title="Scalping AI API", version="0.10.1")
 
 _profit_guard_task: asyncio.Task | None = None
 
 
 async def _profit_guard_loop() -> None:
-    """Second line of defence for the fixed 10-cent net target.
+    """Close a scalp as soon as estimated net PnL reaches +0.10 USDT.
 
-    Binance conditional TP remains installed on every position. In parallel this
-    guard checks unrealized PnL once per second and closes the position with a
-    reduce-only MARKET order as soon as estimated net PnL reaches $0.10 plus a
-    $0.05 reserve. This prevents a stale/missing algo TP from letting a profitable
-    scalp drift back into a loss.
+    The exchange conditional TP still keeps a small +0.05 execution reserve, but
+    that reserve must NOT raise the live PROFIT LOCK threshold. This guard checks
+    once per second and closes reduce-only at MARKET when estimated net PnL is
+    already at the requested +0.10 USDT target.
     """
     while True:
         try:
@@ -94,7 +89,7 @@ async def _profit_guard_loop() -> None:
                         (2 * bot_engine.TAKER_FEE_RATE) + bot_engine.ROUNDTRIP_SLIPPAGE_RATE
                     )
                     estimated_net = gross_pnl - estimated_roundtrip_cost
-                    close_threshold = bot_engine.TARGET_NET_PROFIT_USDT + bot_engine.PROFIT_SAFETY_BUFFER_USDT
+                    close_threshold = bot_engine.TARGET_NET_PROFIT_USDT
                     if estimated_net >= close_threshold:
                         side = "SELL" if float(p.get("position_amt") or 0.0) > 0 else "BUY"
                         bot_engine.runtime.execution_state = "PROFIT_LOCK"
@@ -105,16 +100,15 @@ async def _profit_guard_loop() -> None:
                             "estimated_cost_usdt": round(estimated_roundtrip_cost, 6),
                             "estimated_net_pnl_usdt": round(estimated_net, 6),
                             "target_net_profit_usdt": 0.10,
-                            "buffer_usdt": 0.05,
+                            "exchange_tp_buffer_usdt": 0.05,
+                            "close_threshold_usdt": 0.10,
                         }
                         try:
                             await bot_engine._market_order(symbol, side, qty, reduce_only=True)
                             await bot_engine._cancel_all_orders(symbol)
                             bot_engine.runtime.last_exit_at = __import__("time").time()
-                            bot_engine.runtime.holding_reason = "Прибыль зафиксирована PROFIT LOCK. Переходим к следующему циклу поиска."
+                            bot_engine.runtime.holding_reason = "+0,10 USDT чистыми достигнуто: PROFIT LOCK закрыл позицию. Переходим к следующему циклу поиска."
                         except Exception as exc:
-                            # The exchange TP may have triggered during the same second.
-                            # Re-check before treating the situation as an error.
                             still_open = any(x.get("symbol") == symbol for x in await bot_engine._positions())
                             if still_open:
                                 bot_engine.runtime.last_error = f"PROFIT LOCK не смог закрыть {symbol}: {exc}"
@@ -204,8 +198,6 @@ button.start.running::after{content:'  • ПОИСК ВХОДА';font-size:11px
 TARGET_COMPAT_SCRIPT = r'''
 <script>
 (function(){
-  // Older panel code used a $1 fallback when the API field name changed.
-  // Keep the UI visibly aligned with the canonical backend target.
   function fixTargetLabels(){
     const nodes=[...document.querySelectorAll('div,span,b')];
     for(const n of nodes){
@@ -263,7 +255,7 @@ PERFORMANCE_SCRIPT = r'''
 
 @app.get("/")
 async def root():
-    return {"name":"Scalping AI API","version":"0.10.0","mode":"DEMO_AUTO","engine":"QUALITY_FIRST_SCALPER_V5_FIXED_010","panel":"/panel","performance":"/bot/performance","chart":"/market/klines","target_net_profit_usdt":0.10,"profit_lock":True}
+    return {"name":"Scalping AI API","version":"0.10.1","mode":"DEMO_AUTO","engine":"QUALITY_FIRST_SCALPER_V5_FIXED_010","panel":"/panel","performance":"/bot/performance","chart":"/market/klines","target_net_profit_usdt":0.10,"profit_lock":True,"profit_lock_threshold_estimated_net_usdt":0.10}
 
 @app.get("/panel", response_class=HTMLResponse, include_in_schema=False)
 async def panel():
@@ -272,7 +264,7 @@ async def panel():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "profit_guard": bool(_profit_guard_task and not _profit_guard_task.done()), "target_net_profit_usdt": 0.10}
+    return {"ok": True, "profit_guard": bool(_profit_guard_task and not _profit_guard_task.done()), "target_net_profit_usdt": 0.10, "profit_lock_threshold_estimated_net_usdt": 0.10}
 
 @app.get("/market/live")
 async def live_market(symbol: str = Query(default="BTCUSDT", min_length=5, max_length=20)):
@@ -313,12 +305,12 @@ async def bot_suggestion():
 @app.get("/bot/status")
 async def get_bot_status():
     data = await bot_status()
-    # Backward-compatible names for the existing panel and mobile WebView.
     data["target_net_profit_usdt"] = 0.10
     data["target_net_profit_floor_usdt"] = 0.10
     data["profit_safety_buffer_usdt"] = 0.05
     data["profit_lock_enabled"] = True
-    data["profit_lock_threshold_estimated_net_usdt"] = 0.15
+    data["profit_lock_threshold_estimated_net_usdt"] = 0.10
+    data["profit_lock_note"] = "Позиция закрывается PROFIT LOCK при расчётном net PnL >= +0.10 USDT. +0.05 USDT используется только как запас для биржевого TP."
     return data
 
 @app.get("/bot/performance", summary="Performance / Статистика")
