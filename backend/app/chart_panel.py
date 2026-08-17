@@ -88,4 +88,34 @@ CANDLE_CHART_SCRIPT = r'''
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
 })();
 </script>
+<script>
+(function(){
+  async function closeAllImmediate(){
+    const btn=document.querySelector('button.close');
+    const original=btn?btn.innerHTML:'';
+    if(btn){btn.disabled=true;btn.innerHTML='ЗАКРЫВАЮ...';}
+    try{
+      const r=await fetch('/bot/close-all?confirm=true',{method:'POST',headers:{'accept':'application/json'}});
+      const body=await r.json().catch(()=>({}));
+      if(!r.ok)throw new Error(body.detail||body.message||('HTTP '+r.status));
+      if(typeof log==='function')log('CLOSE ALL POSITIONS выполнено');
+      if(typeof refresh==='function')await refresh();
+    }catch(e){
+      if(typeof log==='function')log('CLOSE ALL ERROR: '+e.message);
+      else alert('Ошибка CLOSE ALL: '+e.message);
+    }finally{
+      if(btn){btn.disabled=false;btn.innerHTML=original||'✕ CLOSE ALL POSITIONS';}
+    }
+  }
+  function bind(){
+    const btn=document.querySelector('button.close');
+    if(!btn)return;
+    btn.removeAttribute('onclick');
+    btn.onclick=closeAllImmediate;
+    window.closeAll=closeAllImmediate;
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind);else bind();
+  setInterval(bind,2000);
+})();
+</script>
 '''
