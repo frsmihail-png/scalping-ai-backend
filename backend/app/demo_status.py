@@ -44,12 +44,28 @@ async def _signed_get(path: str, params: dict | None = None):
     return response.json()
 
 
+def _num(value) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trigger_price(order: dict) -> float:
+    for key in ("triggerPrice", "stopPrice", "activatePrice", "price"):
+        value = _num(order.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
 async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
+    symbol = symbol.upper()
     result = {
         "mode": "DEMO",
         "base_url": BASE_URL,
         "credentials_present": bool(API_KEY and API_SECRET),
-        "symbol": symbol.upper(),
+        "symbol": symbol,
     }
     if not result["credentials_present"]:
         return result
@@ -64,5 +80,43 @@ async def get_demo_status(symbol: str = "BTCUSDT") -> dict:
     result["usdt"] = {
         "balance": float(usdt.get("balance", 0)) if usdt else 0.0,
         "available_balance": float(usdt.get("availableBalance", 0)) if usdt else 0.0,
+    }
+
+    # Restore protection information directly from Binance. This survives a Render
+    # restart/deploy even when the in-memory runtime.last_trade is empty.
+    try:
+        algo_orders = await _signed_get("/fapi/v1/algoOpenOrders", {"symbol": symbol})
+        if not isinstance(algo_orders, list):
+            algo_orders = []
+    except DemoStatusError as exc:
+        algo_orders = []
+        result["protection_error"] = str(exc)
+
+    tp = 0.0
+    sl = 0.0
+    protection_orders: list[dict] = []
+    for order in algo_orders:
+        kind = str(order.get("type") or order.get("orderType") or "").upper()
+        trigger = _trigger_price(order)
+        compact = {
+            "type": kind,
+            "side": str(order.get("side", "")).upper(),
+            "trigger_price": trigger,
+            "status": order.get("status"),
+            "algo_id": order.get("algoId") or order.get("clientAlgoId"),
+            "close_position": order.get("closePosition"),
+        }
+        protection_orders.append(compact)
+        if "TAKE_PROFIT" in kind and trigger > 0:
+            tp = trigger
+        elif "STOP" in kind and "TAKE_PROFIT" not in kind and trigger > 0:
+            sl = trigger
+
+    result["protection"] = {
+        "take_profit": tp,
+        "stop_loss": sl,
+        "protected": bool(tp > 0 and sl > 0),
+        "open_algo_orders": protection_orders,
+        "source": "BINANCE_DEMO_ALGO_OPEN_ORDERS",
     }
     return result
