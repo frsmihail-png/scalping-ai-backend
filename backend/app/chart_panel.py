@@ -14,7 +14,7 @@ CANDLE_CHART_SCRIPT = r'''
     if(!host)return;
     const card=document.createElement('div');
     card.id='tradeChartCard'; card.className='card trade-chart-card';
-    card.innerHTML=`<div class="trade-chart-head"><div><div class="trade-chart-title">ГРАФИК СДЕЛКИ / LIVE CANDLES</div><div id="tradeChartMeta" class="trade-chart-meta">Загрузка...</div></div><div class="trade-chart-tools"><select id="chartTf"><option value="1m">1m</option><option value="3m">3m</option><option value="5m">5m</option><option value="15m">15m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1 день</option><option value="1w">1 неделя</option><option value="1M">1 месяц</option></select><button class="btn stop" id="chartRefresh" style="padding:7px 10px">↻</button></div></div><div class="chart-wrap"><canvas id="tradeCanvas"></canvas></div><div class="chart-legend"><span class="lg"><i class="dot entry-dot"></i>ENTRY</span><span class="lg"><i class="dot tp-dot"></i>TAKE PROFIT</span><span class="lg"><i class="dot sl-dot"></i>STOP LOSS</span><span class="lg"><i class="dot price-dot"></i>ТЕКУЩАЯ ЦЕНА</span></div>`;
+    card.innerHTML=`<div class="trade-chart-head"><div><div class="trade-chart-title">ГРАФИК СДЕЛКИ / LIVE CANDLES</div><div id="tradeChartMeta" class="trade-chart-meta">Загрузка...</div></div><div class="trade-chart-tools"><select id="chartTf"><option value="1m">1m</option><option value="3m">3m</option><option value="5m">5m</option><option value="15m">15m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1 день</option><option value="1w">1 неделя</option><option value="1M">1 месяц</option></select><button class="btn stop" id="chartRefresh" style="padding:7px 10px">↻</button></div></div><div class="chart-wrap"><canvas id="tradeCanvas"></canvas></div><div class="chart-legend"><span class="lg"><i class="dot entry-dot"></i>ENTRY</span><span class="lg"><i class="dot tp-dot"></i>TAKE PROFIT</span><span class="lg"><i class="dot sl-dot"></i>STOP LOSS</span><span class="lg"><i class="dot price-dot"></i>ТЕКУЩАЯ ЦЕНА</span><span id="protectionBadge" class="lg"></span></div>`;
     if(perf)host.insertBefore(card,perf);else host.appendChild(card);
     document.getElementById('chartTf').addEventListener('change',e=>{interval=e.target.value;loadChart()});
     document.getElementById('chartRefresh').addEventListener('click',loadChart);
@@ -27,8 +27,10 @@ CANDLE_CHART_SCRIPT = r'''
     const protection=protectionState?.protection||{};
     const liveTp=Number(protection.take_profit||0);
     const liveSl=Number(protection.stop_loss||0);
-    if(p){return {symbol:p.symbol||t.symbol,entry:Number(p.entry_price||t.entry_price||0),mark:Number(p.mark_price||0),tp:liveTp||Number(t.take_profit||0),sl:liveSl||Number(t.stop_loss||0),side:Number(p.position_amt||0)>0?'LONG':'SHORT',open:true,protected:Boolean(protection.protected)};}
-    if(t?.symbol){return {symbol:t.symbol,entry:Number(t.entry_price||0),mark:0,tp:liveTp||Number(t.take_profit||0),sl:liveSl||Number(t.stop_loss||0),side:t.side==='BUY'?'LONG':'SHORT',open:false,protected:Boolean(protection.protected)};}
+    const tp=liveTp||Number(t.take_profit||0);
+    const sl=liveSl||Number(t.stop_loss||0);
+    if(p){return {symbol:p.symbol||t.symbol,entry:Number(p.entry_price||t.entry_price||0),mark:Number(p.mark_price||0),tp,sl,side:Number(p.position_amt||0)>0?'LONG':'SHORT',open:true,protected:Boolean(protection.protected||tp>0&&sl>0)};}
+    if(t?.symbol){return {symbol:t.symbol,entry:Number(t.entry_price||0),mark:0,tp,sl,side:t.side==='BUY'?'LONG':'SHORT',open:false,protected:Boolean(protection.protected||tp>0&&sl>0)};}
     return null;
   }
   async function loadProtection(symbol){
@@ -37,7 +39,7 @@ CANDLE_CHART_SCRIPT = r'''
       if(!r.ok)throw new Error(await r.text());
       protectionState=await r.json();
     }catch(e){
-      protectionState={protection:{take_profit:0,stop_loss:0,protected:false},protection_error:e.message};
+      protectionState={protection:{take_profit:0,stop_loss:0,protected:false},protection_error:String(e?.message||e)};
     }
   }
   async function loadChart(){
@@ -52,15 +54,22 @@ CANDLE_CHART_SCRIPT = r'''
       const r=await fetch(`/market/klines?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(interval)}&limit=120`,{cache:'no-store'});
       if(!r.ok)throw new Error(await r.text()); candles=await r.json();
       const meta=document.getElementById('tradeChartMeta');
+      const badge=document.getElementById('protectionBadge');
       if(meta){
         if(tr){
-          const protectionText=tr.protected?' • TP/SL: BINANCE OK':' • TP/SL: НЕ НАЙДЕНЫ';
           meta.className='trade-chart-meta '+(tr.protected?'protection-ok':'protection-bad');
-          meta.textContent=`${selectedSymbol} • ${interval} • ${tr.side} • Entry ${fmt(tr.entry)} • TP ${tr.tp>0?fmt(tr.tp):'—'} • SL ${tr.sl>0?fmt(tr.sl):'—'}${protectionText}`;
+          meta.textContent=`${selectedSymbol} • ${interval} • ${tr.side} • Entry ${fmt(tr.entry)} • TP ${tr.tp>0?fmt(tr.tp):'—'} • SL ${tr.sl>0?fmt(tr.sl):'—'}`;
         }else{
           meta.className='trade-chart-meta';
           meta.textContent=`${selectedSymbol} • ${interval} • нет открытой позиции`;
         }
+      }
+      if(badge){
+        if(tr?.open){
+          const src=protectionState?.protection?.source||'';
+          badge.className='lg '+(tr.protected?'protection-ok':'protection-bad');
+          badge.textContent=tr.protected?`● TP/SL АКТИВНЫ${src?' • Binance':''}`:'⚠ TP/SL НЕ НАЙДЕНЫ В BINANCE';
+        }else badge.textContent='';
       }
       draw();
     }catch(e){const meta=document.getElementById('tradeChartMeta');if(meta){meta.className='trade-chart-meta protection-bad';meta.textContent='Ошибка графика: '+e.message;}}
